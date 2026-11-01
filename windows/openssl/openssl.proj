@@ -1,0 +1,44 @@
+<!--
+  MSBuild sub-project: builds a static OpenSSL for MSVC. Thin Exec-task
+  wrapper, no VC++ project schema (no ClCompile/Link items, no
+  PlatformToolset) - just MSBuild fundamentals, mirroring
+  windows\openssl\Makefile's nmake logic exactly.
+
+  Kept separate from windows\gsocket.proj on purpose - OpenSSL's own build
+  is large, slow, and rarely changes, unlike gsocket's own sources. The
+  parent project depends on $(OpenSSLInstall)\lib\libssl.lib and invokes
+  this project (via the MSBuild task) only when that file is missing.
+
+  Override any property on the command line if needed, e.g.:
+    msbuild openssl.proj /p:OpenSSLSrc=D:\src\openssl /p:OpenSSLInstall=D:\out\openssl
+  Defaults match the layout windows\build-openssl.bat already used.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup>
+    <OpenSSLSrc Condition="'$(OpenSSLSrc)'==''">$(MSBuildThisFileDirectory)..\build\openssl-src</OpenSSLSrc>
+    <OpenSSLInstall Condition="'$(OpenSSLInstall)'==''">$(MSBuildThisFileDirectory)..\build\openssl-install</OpenSSLInstall>
+    <Strawberry Condition="'$(Strawberry)'==''">$(MSBuildThisFileDirectory)..\build\strawberry-perl-extracted</Strawberry>
+  </PropertyGroup>
+
+  <Target Name="Build" Condition="!Exists('$(OpenSSLInstall)\lib\libssl.lib')">
+    <Error Condition="!Exists('$(OpenSSLSrc)\Configure')"
+           Text="OpenSSL source not found at $(OpenSSLSrc) - fetch/extract it there first (see windows\build-openssl.bat for the known-good version)." />
+    <Error Condition="!Exists('$(Strawberry)\perl\bin\perl.exe')"
+           Text="Perl not found at $(Strawberry)\perl\bin\perl.exe - OpenSSL's Configure script needs it (see windows\build-openssl.bat for how this was fetched)." />
+    <Exec Command='cd "$(OpenSSLSrc)" &amp;&amp; set "PATH=$(Strawberry)\perl\bin;$(Strawberry)\c\bin;%PATH%" &amp;&amp; perl Configure VC-WIN64A no-asm no-shared --prefix="$(OpenSSLInstall)" --openssldir="$(OpenSSLInstall)" &amp;&amp; nmake &amp;&amp; nmake install_sw' />
+  </Target>
+
+  <!-- Removes the installed/built output only - a later Build re-runs
+       Configure+nmake against the still-present source tree. -->
+  <Target Name="Clean">
+    <RemoveDir Directories="$(OpenSSLInstall)" Condition="Exists('$(OpenSSLInstall)')" />
+  </Target>
+
+  <!-- Also drops the ~5.7GB source checkout itself - a from-scratch Build
+       after this needs OpenSSLSrc repopulated first. -->
+  <Target Name="Distclean" DependsOnTargets="Clean">
+    <RemoveDir Directories="$(OpenSSLSrc)" Condition="Exists('$(OpenSSLSrc)')" />
+  </Target>
+
+</Project>

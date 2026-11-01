@@ -1,0 +1,87 @@
+<!--
+  MSBuild top-level build: gsocket.lib + gs-tunnel.exe + gs-netcat.exe.
+  Mirrors windows\Makefile - keep both in sync when files/flags change.
+  Thin Exec-task wrapper, no VC++ project schema (no ClCompile/Link items,
+  no PlatformToolset) - just MSBuild fundamentals.
+
+  One documented asymmetry vs. the NMake version: incremental up-to-date
+  checking here is per-TARGET (the whole lib, or the whole gs-netcat.exe
+  object set), not per-file - touching one lib/*.c file rebuilds all 9,
+  not just that one. Still correct (never skips a real rebuild that's
+  actually needed), just coarser-grained. True per-file MSBuild batching
+  without the real ClCompile item type is possible but adds real
+  complexity for a codebase this size; not done here.
+
+  Assumes an already-activated VC dev environment (cl/lib/link on PATH) -
+  same convention as windows\Makefile. Override any property on the
+  command line, e.g.: msbuild gsocket.proj /p:OsslDir=D:\openssl
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup>
+    <Root Condition="'$(Root)'==''">$(MSBuildThisFileDirectory)..</Root>
+    <OsslDir Condition="'$(OsslDir)'==''">$(MSBuildThisFileDirectory)build\openssl-install</OsslDir>
+    <OsslSrc Condition="'$(OsslSrc)'==''">$(MSBuildThisFileDirectory)build\openssl-src</OsslSrc>
+    <Strawberry Condition="'$(Strawberry)'==''">$(MSBuildThisFileDirectory)build\strawberry-perl-extracted</Strawberry>
+    <OutDir Condition="'$(OutDir)'==''">$(MSBuildThisFileDirectory)build</OutDir>
+    <LibDir>$(Root)\lib</LibDir>
+    <ToolsDir>$(Root)\tools</ToolsDir>
+    <IncDir>$(Root)\include</IncDir>
+    <ObjDir>$(OutDir)\obj</ObjDir>
+    <ObjDirNetcat>$(OutDir)\obj-netcat</ObjDirNetcat>
+    <CFlags>/nologo /W3 /O2 /MT /MP</CFlags>
+    <SysLibs>ws2_32.lib crypt32.lib advapi32.lib user32.lib gdi32.lib</SysLibs>
+    <OsslLibs>&quot;$(OsslDir)\lib\libssl.lib&quot; &quot;$(OsslDir)\lib\libcrypto.lib&quot;</OsslLibs>
+    <LibInc>/I&quot;$(LibDir)&quot; /I&quot;$(IncDir)&quot; /I&quot;$(OsslDir)\include&quot;</LibInc>
+    <NetcatInc>/I&quot;$(ToolsDir)&quot; /I&quot;$(LibDir)&quot; /I&quot;$(IncDir)&quot; /I&quot;$(OsslDir)\include&quot;</NetcatInc>
+  </PropertyGroup>
+
+  <!-- Keep in sync with lib/*.c in the repo. -->
+  <ItemGroup>
+    <LibSources Include="$(LibDir)\buf.c;$(LibDir)\event.c;$(LibDir)\gsocket-engine.c;$(LibDir)\gsocket-select.c;$(LibDir)\gsocket-sha256.c;$(LibDir)\gsocket-ssl.c;$(LibDir)\gsocket-util.c;$(LibDir)\list.c;$(LibDir)\packet.c" />
+    <LibHeaders Include="$(LibDir)\gs-common.h;$(LibDir)\win32-compat.h;$(LibDir)\gs-externs.h;$(LibDir)\gsocket-engine.h;$(LibDir)\gsocket-sha256.h;$(IncDir)\gsocket\gsocket.h;$(IncDir)\gsocket\packet.h;$(IncDir)\gsocket\gsocket-ssl.h;$(IncDir)\gsocket\gs-select.h;$(IncDir)\gsocket\event.h;$(IncDir)\gsocket\list.h;$(IncDir)\gsocket\buf.h;$(IncDir)\gsocket\gs-readline.h" />
+    <!-- Keep in sync with gs-netcat's sources in tools/ (everything
+         gs-netcat.exe links except gs-tunnel.c, its own target below). -->
+    <NetcatSources Include="$(ToolsDir)\4_gs-netcat.c;$(ToolsDir)\utils.c;$(ToolsDir)\socks.c;$(ToolsDir)\event_mgr.c;$(ToolsDir)\pkt_mgr.c;$(ToolsDir)\stubs.c;$(ToolsDir)\win_getopt.c;$(ToolsDir)\win_childproc.c;$(ToolsDir)\gsocket_dso-lib.c" />
+    <NetcatHeaders Include="$(ToolsDir)\common.h;$(ToolsDir)\gs-netcat.h;$(ToolsDir)\utils.h;$(ToolsDir)\socks.h;$(ToolsDir)\pkt_mgr.h;$(ToolsDir)\event_mgr.h;$(ToolsDir)\stubs.h;$(ToolsDir)\win_getopt.h;$(ToolsDir)\win_childproc.h;$(ToolsDir)\gsocket_dso-lib.h;$(ToolsDir)\console_display.h" />
+    <NetcatObjs Include="@(NetcatSources->'$(ObjDirNetcat)\%(Filename).obj')" />
+  </ItemGroup>
+
+  <Target Name="Build" DependsOnTargets="GsTunnel;GsNetcat" />
+
+  <!-- Delegates to the separate OpenSSL sub-project (windows\openssl\) -
+       see that project for why it's kept distinct. Its own Build target
+       is a no-op if $(OsslDir)\lib\libssl.lib already exists. -->
+  <Target Name="OpenSSL">
+    <MSBuild Projects="openssl\openssl.proj" Targets="Build" Properties="OpenSSLSrc=$(OsslSrc);OpenSSLInstall=$(OsslDir);Strawberry=$(Strawberry)" />
+  </Target>
+
+  <Target Name="Lib" DependsOnTargets="OpenSSL" Inputs="@(LibSources);@(LibHeaders)" Outputs="$(OutDir)\gsocket.lib">
+    <MakeDir Directories="$(ObjDir)" Condition="!Exists('$(ObjDir)')" />
+    <Exec Command="cl $(CFlags) /DHAVE_LIBCRYPTO=1 $(LibInc) /c /Fo&quot;$(ObjDir)\\&quot; @(LibSources->'&quot;%(FullPath)&quot;', ' ')" />
+    <Exec Command="lib /nologo /OUT:&quot;$(OutDir)\gsocket.lib&quot; @(LibSources->'&quot;$(ObjDir)\%(Filename).obj&quot;', ' ')" />
+  </Target>
+
+  <!-- gs-tunnel.c does NOT get -DHAVE_LIBCRYPTO=1 - matching the existing,
+       already-verified build-tunnel.bat/windows\Makefile exactly. Not
+       something to "fix" as a side effect here. -->
+  <Target Name="GsTunnel" DependsOnTargets="Lib;OpenSSL" Inputs="$(ToolsDir)\gs-tunnel.c;$(OutDir)\gsocket.lib" Outputs="$(OutDir)\gs-tunnel.exe">
+    <MakeDir Directories="$(OutDir)" Condition="!Exists('$(OutDir)')" />
+    <Exec Command="cl $(CFlags) $(LibInc) &quot;$(ToolsDir)\gs-tunnel.c&quot; /Fo&quot;$(OutDir)\\&quot; /Fe:&quot;$(OutDir)\gs-tunnel.exe&quot; /link &quot;$(OutDir)\gsocket.lib&quot; $(OsslLibs) $(SysLibs)" />
+  </Target>
+
+  <Target Name="GsNetcat" DependsOnTargets="Lib;OpenSSL" Inputs="@(NetcatSources);@(NetcatHeaders);$(OutDir)\gsocket.lib" Outputs="$(OutDir)\gs-netcat.exe">
+    <MakeDir Directories="$(ObjDirNetcat)" Condition="!Exists('$(ObjDirNetcat)')" />
+    <Exec Command="cl $(CFlags) /DHAVE_LIBCRYPTO=1 $(NetcatInc) /c /Fo&quot;$(ObjDirNetcat)\\&quot; @(NetcatSources->'&quot;%(FullPath)&quot;', ' ')" />
+    <Exec Command="cl $(CFlags) /Fe:&quot;$(OutDir)\gs-netcat.exe&quot; @(NetcatObjs->'&quot;%(FullPath)&quot;', ' ') /link &quot;$(OutDir)\gsocket.lib&quot; $(OsslLibs) $(SysLibs)" />
+  </Target>
+
+  <Target Name="Clean">
+    <RemoveDir Directories="$(ObjDir)" Condition="Exists('$(ObjDir)')" />
+    <RemoveDir Directories="$(ObjDirNetcat)" Condition="Exists('$(ObjDirNetcat)')" />
+    <Delete Files="$(OutDir)\gsocket.lib;$(OutDir)\gs-tunnel.exe;$(OutDir)\gs-netcat.exe" />
+  </Target>
+
+  <Target Name="Rebuild" DependsOnTargets="Clean;Build" />
+
+</Project>
