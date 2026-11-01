@@ -30,18 +30,34 @@ typedef struct
 	void *args[256];
 } GS_PKT;
 
+#ifdef _MSC_VER
+# pragma pack(push, 1)
+#endif
+
 struct gs_pkt_msg_hdr
 {
 	uint8_t esc;
 	uint8_t type;
-} __attribute__((__packed__));
+}
+#ifndef _MSC_VER
+__attribute__((__packed__))
+#endif
+;
 
 struct gs_pkt_chn_hdr
 {
 	uint8_t esc;
 	uint8_t type;
 	uint16_t len;
-} __attribute__((__packed__));
+}
+#ifndef _MSC_VER
+__attribute__((__packed__))
+#endif
+;
+
+#ifdef _MSC_VER
+# pragma pack(pop)
+#endif
 
 
 #define GS_PKT_IS_CHANNEL(a)		(((a) >> 7) & 0x01)

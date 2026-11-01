@@ -1,6 +1,8 @@
 
 #include "gs-common.h"
+#ifndef _WIN32
 #include <fcntl.h>
+#endif
 #include <gsocket/gsocket.h>
 #include <gsocket/gs-select.h>
 #include "gsocket-engine.h"

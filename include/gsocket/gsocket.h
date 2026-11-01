@@ -39,11 +39,11 @@
 #define GS_LOG_LEVEL_MOREVERB      (2) // -vv
 #define GS_LOG_LEVEL_INSANE        (3) // -vvv
 
-#define GS_LOG(a...)               do { GS_log(GS_LOG_TYPE_NORMAL, GS_LOG_LEVEL_NONE, a); } while(0)
-#define GS_LOG_V(a...)             do { GS_log(GS_LOG_TYPE_NORMAL, GS_LOG_LEVEL_VERBOSE, a); } while(0)
-#define GS_LOG_VV(a...)            do { GS_log(GS_LOG_TYPE_NORMAL, GS_LOG_LEVEL_MOREVERB, a); } while(0)
-#define GS_LOG_VVV(a...)           do { GS_log(GS_LOG_TYPE_NORMAL, GS_LOG_LEVEL_INSANE, a); } while(0)
-#define GS_LOG_ERR(a...)           do { GS_log(GS_LOG_TYPE_ERROR, GS_LOG_LEVEL_NONE, a); } while(0)
+#define GS_LOG(...)               do { GS_log(GS_LOG_TYPE_NORMAL, GS_LOG_LEVEL_NONE, __VA_ARGS__); } while(0)
+#define GS_LOG_V(...)             do { GS_log(GS_LOG_TYPE_NORMAL, GS_LOG_LEVEL_VERBOSE, __VA_ARGS__); } while(0)
+#define GS_LOG_VV(...)            do { GS_log(GS_LOG_TYPE_NORMAL, GS_LOG_LEVEL_MOREVERB, __VA_ARGS__); } while(0)
+#define GS_LOG_VVV(...)           do { GS_log(GS_LOG_TYPE_NORMAL, GS_LOG_LEVEL_INSANE, __VA_ARGS__); } while(0)
+#define GS_LOG_ERR(...)           do { GS_log(GS_LOG_TYPE_ERROR, GS_LOG_LEVEL_NONE, __VA_ARGS__); } while(0)
 
 #include <gsocket/list.h>
 #include <gsocket/event.h>
@@ -448,7 +448,9 @@ void GS_format_bps(char *dst, size_t size, int64_t bytes, const char *suffix);
 #define GS_BPS_MAXSIZE       (8)  // _without_ length of suffix!
 char *GS_format_since(char *dst, size_t sz, int32_t sec);
 #define GS_SINCE_MAXSIZE     (7)
+#ifndef _WIN32
 char *GS_getpidwd(pid_t pid);
+#endif
 
 const char *GS_gen_secret(void);
 const char *GS_user_secret(GS_CTX *ctx, const char *file, const char *sec_str);

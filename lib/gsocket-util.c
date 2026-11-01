@@ -214,7 +214,11 @@ b58enc(char *b58, size_t *b58sz, uint8_t *src, size_t binsz)
             ++zcount;
 
     size = (binsz - zcount) * 138 / 100 + 1;
+#ifdef _MSC_VER
+    uint8_t *buf = (uint8_t *)_alloca(size); /* MSVC has no C99 VLAs; size is tiny (bounded by GS_SECRET_MAX_LEN) */
+#else
     uint8_t buf[size];
+#endif
     memset(buf, 0, size);
 
     for (i = zcount, high = size - 1; i < binsz; ++i, high = j)
@@ -423,8 +427,9 @@ GS_format_since(char *dst, size_t dst_sz, int32_t sec)
 	return dst;
 }
 
+#ifndef _WIN32
 // Get Working Directory of process with id pid or if this fails then current cwd
-// of this process.
+// of this process. Not implemented on Windows (unused by gs-tunnel).
 char *
 GS_getpidwd(pid_t pid)
 {
@@ -499,6 +504,7 @@ err:
 	DEBUGF_W("PID %d CWD=%s\n", pid, wd);
 	return wd;
 }
+#endif /* !_WIN32 */
 
 /*
  * Duplicate the process. Child returns. Parent monitors child
@@ -509,6 +515,20 @@ err:
  * the child. This is used to detect BAD-AUTH from the GSRN.
  * Set to -1 to ignore.
  */
+#ifdef _WIN32
+/*
+ * Daemonize/watchdog relies on fork()/wait()/SIGCHLD, which have no Win32
+ * equivalent. Not needed by gs-tunnel (it always runs in the foreground;
+ * use a Windows service wrapper if backgrounding is required).
+ */
+void
+GS_daemonize(FILE *logfp, int code_force_exit)
+{
+	(void)code_force_exit;
+	gs_errfp = logfp;
+	ERREXIT("GS_daemonize() (-D) is not supported on Windows. Run in the foreground.\n");
+}
+#else
 void
 GS_daemonize(FILE *logfp, int code_force_exit)
 {
@@ -590,6 +610,7 @@ GS_daemonize(FILE *logfp, int code_force_exit)
 
 	exit(255);	// NOT REACHED
 }
+#endif /* !_WIN32 */
 
 // Sanitize a string
 const char *

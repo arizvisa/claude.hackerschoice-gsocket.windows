@@ -1,17 +1,19 @@
 
 #include "gs-common.h"
+#ifndef _WIN32
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
-#include <unistd.h>
 #include <openssl/sha.h>
 #include <gsocket/gsocket.h>
 #include "gsocket-engine.h"
@@ -75,8 +77,8 @@ int_ntoa(uint32_t ip)
 }
 #endif
 
-#define gs_set_error(gs_ctx, a...)	do { \
-	snprintf(gs_ctx->err_buf, sizeof (gs_ctx)->err_buf, a); \
+#define gs_set_error(gs_ctx, ...)	do { \
+	snprintf(gs_ctx->err_buf, sizeof (gs_ctx)->err_buf, __VA_ARGS__); \
 } while (0)
 
 void
@@ -1194,7 +1196,7 @@ gs_net_new_socket(GS *gsocket, struct gs_sox *sox)
 	if (s < 0)
 		return -1;
 
-	ret = fcntl(s, F_SETFL, O_NONBLOCK | fcntl(s, F_GETFL, 0));
+	ret = gs_set_nonblock(s, 1);
 	if (ret != 0)
 		return -1;
 
@@ -1458,7 +1460,7 @@ gs_connect_blocking(GS *gsocket)
 		DEBUGF("Setting FD BLOCKING\n");
 		int tcp_fd = gsocket->fd;
 		/* Make tcp fd 'blocking' for caller. */
-		fcntl(tcp_fd, F_SETFL, ~O_NONBLOCK & fcntl(tcp_fd, F_GETFL, 0));
+		gs_set_nonblock(tcp_fd, 0);
 
 		return ret;
 	}
@@ -1636,7 +1638,7 @@ gs_accept_blocking(GS *gsocket, GS *new_gs)
 			continue;
 
 		/* Make tcp fd 'blocking' for caller. */
-		fcntl(new_gs->fd, F_SETFL, ~O_NONBLOCK & fcntl(new_gs->fd, F_GETFL, 0));
+		gs_set_nonblock(new_gs->fd, 0);
 		return 0;
 	}
 
