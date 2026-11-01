@@ -1,0 +1,9 @@
+build/
+
+# Manual fallback scripts - kept on disk for convenience, never tracked.
+# The real, dependency-tracked build is windows/Makefile (nmake) and
+# windows/gsocket.proj (msbuild).
+build-openssl.bat
+build-lib.bat
+build-tunnel.bat
+build-gs-netcat.bat
