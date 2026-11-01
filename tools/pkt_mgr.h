@@ -22,12 +22,19 @@
 #define GS_FT_CHN_DL            (7)  // 135 0x87
 #define GS_CHN_PWD              (8)  // Result of pwd-request (server to client)
 
+#ifdef _MSC_VER
+# define GS_PACKED
+# pragma pack(push, 1)
+#else
+# define GS_PACKED __attribute__((__packed__))
+#endif
+
 struct _pkt_app_ping
 {
 	uint8_t flags;
 	uint8_t resever[3];
 	uint8_t user[12];
-} __attribute__((__packed__));
+} GS_PACKED;
 
 struct _pkt_app_pong
 {
@@ -35,13 +42,13 @@ struct _pkt_app_pong
 	uint16_t idle;
 	uint8_t n_users;
 	uint8_t user[11];
-} __attribute__((__packed__));
+} GS_PACKED;
 
 struct _pkt_app_ids
 {
 	uint8_t flags;
 	uint8_t reserved[3];
-} __attribute__((__packed__));
+} GS_PACKED;
 
 #define GS_PKT_APP_FL_IDS	(0x01)
 
@@ -49,7 +56,7 @@ struct _pkt_app_log
 {
 	uint8_t type;
 	uint8_t msg[63];
-} __attribute__((__packed__));
+} GS_PACKED;
 
 #define GS_PKT_APP_LOG_TYPE_DEFAULT	(0x00)  // default color
 #define GS_PKT_APP_LOG_TYPE_ALERT	(0x01)  // RED
@@ -61,9 +68,13 @@ struct _pkt_app_status
 {
 	uint8_t type;
 	uint8_t msg[63];
-} __attribute__((__packed__));
+} GS_PACKED;
 
 #define GS_PKT_APP_STATUS_TYPE_NOPTY  (0x01)  // Server could not allocate PTY
+
+#ifdef _MSC_VER
+# pragma pack(pop)
+#endif
 
 void pkt_app_cb_wsize(uint8_t msg, const uint8_t *data, size_t len, void *ptr);
 void pkt_app_cb_ping(uint8_t msg, const uint8_t *data, size_t len, void *ptr);

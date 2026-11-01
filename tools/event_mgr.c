@@ -6,10 +6,8 @@
 
 #include "common.h"
 #include "event_mgr.h"
-#include "console.h"
 #include "utils.h"
 #include "pkt_mgr.h"
-#include "ids.h"
 
 /*
  * When console is visible then send a ping more often.

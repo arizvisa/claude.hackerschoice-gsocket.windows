@@ -34,21 +34,21 @@
  *		sockets and connections.
  */
  
+/*
+ * Windows port. common.h pulls in win32-compat.h + stubs.h (console/ids/
+ * filetransfer stand-ins, see stubs.h) + gsocket_dso-lib.h. console.h,
+ * ids.h, filetransfer_mgr.h and gsocket_dso-lib.h are not separate files
+ * here - their declarations live in stubs.h/common.h instead. man_gs-netcat.h
+ * (upstream's built-in man page text) is not ported; -m prints nothing.
+ */
 #include "common.h"
 #include "utils.h"
 #include "socks.h"
-#include "console.h"
 #include "event_mgr.h"
 #include "pkt_mgr.h"
-#include "ids.h"
 #include "gs-netcat.h"
-#include "filetransfer_mgr.h"
-#ifndef STEALTH
-# include "man_gs-netcat.h"
-#else
+#include "win_childproc.h"
 const char *man_str = "";
-#endif
-#include "gsocket_dso-lib.h"
 
 /* All connected gs-peers indexed by gs->fd */
 static struct _peer *peers[FD_SETSIZE];
@@ -674,8 +674,10 @@ cb_read_gs(GS_SELECT_CTX *ctx, int fd, void *arg, int val)
 				/* HERE: Client */
 				if (p->is_stty_set_raw == 0)
 				{
-					/* Set TTY=raw first time we receive data [connection alive] */
-					XASSERT(p->fd_in == STDIN_FILENO, "p->fd_in = %d, not STDIN\n", p->fd_in);
+					/* Set TTY=raw first time we receive data [connection alive].
+					 * Windows: p->fd_in is our bridged loopback socket, not a
+					 * literal STDIN_FILENO (see win_stdio_bridge_fd()) - the
+					 * upstream sanity-check assertion doesn't apply here. */
 					stty_set_raw();
 					p->is_stty_set_raw = 1;
 				}
@@ -952,7 +954,9 @@ peer_new_init(GS *gs)
 		{
 			/* CLIENT, interactive */
 			my_peer = p;
-			signal(SIGWINCH, cb_sigwinch);
+			/* No SIGWINCH on Windows - initial size is still sent once
+			 * (via gopt.is_win_resized=1 in cb_connect_client below), just
+			 * no live resize-tracking while the session runs. */
 			get_winsize();
 			GS_EVENT_add_by_ts(&gs->ctx->gselect_ctx->emgr, &gopt.event_ping, 0, GS_APP_PINGFREQ, cbe_ping, p, 0);
 			GS_EVENT_add_by_ts(&gs->ctx->gselect_ctx->emgr, &gopt.event_bps, 0, GS_APP_BPSFREQ, cbe_bps, p, 0);
@@ -1048,8 +1052,11 @@ peer_new(GS_SELECT_CTX *ctx, GS *gs)
 		p->fd_out = p->fd_in;
 		p->is_network_forward = 1;		
 	} else {
-		p->fd_in = STDIN_FILENO;	// Forward to STDIN/STDOUT
-		p->fd_out = STDOUT_FILENO;
+		/* Forward to STDIN/STDOUT. Windows: bridge the real console into a
+		 * single socket fd (see win_stdio_bridge_fd()) - Winsock's select()
+		 * can't multiplex a raw console/pipe handle directly. */
+		p->fd_in = win_stdio_bridge_fd();
+		p->fd_out = p->fd_in;
 		p->is_stdin_forward = 1;
 	}
 
@@ -1164,11 +1171,11 @@ do_server(void)
 
 	/* Add all listening fd's to select()-subsystem */
 	GS_listen_add_gs_select(gopt.gsocket, &ctx, cb_listen, gopt.gsocket, 0);
-	if (gopt.is_internal)
-	{
-		GS_SELECT_add_cb_r(&ctx, cb_read_stdin, STDIN_FILENO, NULL, 0);
-		XFD_SET(STDIN_FILENO, ctx.rfd);
-	}
+	/* Windows: gopt.is_internal (parent-death-detection via watching our own
+	 * STDIN, used by the unported gs-sftp/gs-mount wrapper scripts) is not
+	 * supported - cb_read_stdin's STDIN_FILENO isn't select()-able here
+	 * anyway. Not reachable in normal end-user usage (requires the
+	 * _GSOCKET_INTERNAL env var, which those unported wrappers set). */
 
 
 	while (1)
@@ -1383,16 +1390,15 @@ do_client(void)
 
 	if (gopt.is_multi_peer == 0)
 	{
-		/* Read/Write from STDIN/STDOUT. No TCP. */
-		/* STDIN can be blocking */
-		p = gs_and_peer_connect(&ctx, gopt.gsocket, STDIN_FILENO, STDOUT_FILENO);
+		/* Read/Write from STDIN/STDOUT. No TCP.
+		 * Windows: bridge the real console into a socket fd - see the
+		 * matching peer_new() comment for why (select() needs a socket). */
+		int stdio_fd = win_stdio_bridge_fd();
+		p = gs_and_peer_connect(&ctx, gopt.gsocket, stdio_fd, stdio_fd);
 		p->is_stdin_forward = 1;
 	} else {
-		if (gopt.is_internal)
-		{
-			GS_SELECT_add_cb_r(&ctx, cb_read_stdin, STDIN_FILENO, NULL, 0);
-			XFD_SET(STDIN_FILENO, ctx.rfd);
-		}
+		/* Windows: gopt.is_internal not supported here either - see the
+		 * matching comment in do_server(). */
 		GS_SELECT_add_cb(&ctx, cb_accept, cb_accept, gopt.listen_fd, NULL, 0);
 		XFD_SET(gopt.listen_fd, ctx.rfd);	/* listening socket */
 	}
@@ -1550,8 +1556,10 @@ my_getopt(int argc, char *argv[])
 	if (gopt.gs_server_check_sec > 0)
 	{
 		DEBUGF_G("SERVER_CHECK_SEC=%s (%d)\n", ptr, gopt.gs_server_check_sec);
-		alarm(gopt.gs_server_check_sec);
-		signal(SIGALRM, cb_sigalarm);
+		/* Windows: no alarm()/SIGALRM. -t still works via the normal
+		 * GS_connect() status-code checks in cb_connect_client() below;
+		 * it just has no hard timeout safety net if the GSRN connection
+		 * itself hangs instead of returning CONNREFUSED/SERVER_OK. */
 	}
 
 	if (gopt.is_daemon)
@@ -1790,6 +1798,10 @@ int
 main(int argc, char *argv[])
 {
 	// my_test();
+	WSADATA wsa;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+		ERREXIT("WSAStartup() failed\n");
+
 	init_defaults(&argc, &argv);
 	my_getopt(argc, argv);
 

@@ -1,5 +1,3 @@
-
-
 #ifndef __GSNC_UTILS_H__
 #define __GSNC_UTILS_H__ 1
 
@@ -20,26 +18,17 @@ void stty_switch_nopty(void);
 void stty_reset(void);
 void stty_check_esc(GS *gs, char c);
 void ctrl_c_child(pid_t pid);
-// char **mk_env(char **blacklist, char **addlist);
 void get_winsize(void);
 void cmd_ping(struct _peer *p);
 void cmd_pwd(struct _peer *p);
-// void sanitze_name_to_string(uint8_t *str, size_t len);
-void sanitize_fname_to_str(uint8_t *str, size_t len);
-void format_bps(char *buf, size_t size, int64_t bytes);
 char *getcwdx(void);
 void gs_watchdog(void);
 
-
-// #define VLOG(a...)	do{if (gopt.log_fp != NULL){ fprintf(gopt.log_fp, a); fflush(gopt.log_fp); } }while(0)
-
-// Log with Timestamp + Peer-ID
-#define GS_LOG_TSP(_p, _a...)	do{ \
+#define GS_LOG_TSP(_p, ...)	do{ \
 	GS_LOG("%s [ID=%d] ", GS_logtime(), _p->id); \
-	GS_LOG(_a);  \
+	GS_LOG(__VA_ARGS__);  \
 }while(0)
 
-/* hack to set rows/columns */
 #define GS_STTY_INIT_HACK	"stty rows %d columns %d\r"
 
 #define UTILS_GETOPT_STR	"3:vigqwACTrIlSDL:a:s:k:p:d:e:"
