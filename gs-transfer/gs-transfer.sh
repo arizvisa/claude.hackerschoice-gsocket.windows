@@ -1,10 +1,31 @@
 #!/usr/bin/env bash
-# gs-transfer client - see ../PROTOCOL.md for the wire format.
+# gs-transfer (POSIX) - single-deployable client+server. See ../PROTOCOL.md
+# for the wire format.
+#
+# -l selects server (responder) mode, exactly like gs-netcat's own -l.
+# Without -l, this runs the client.
 #
 # Usage:
-#   gs-transfer-client.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] ls [path]
-#   gs-transfer-client.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] get <remote-path> [local-path]
-#   gs-transfer-client.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] put <local-path> [remote-path]
+#   gs-transfer.sh -l [-s <secret>|-k <file>] [-T]
+#       Server mode. Launches gs-netcat itself (-l, plus whatever secret/
+#       proxy flags were given) with -e pointing back at this same script -
+#       no gs-netcat command line to construct by hand. Can also still be
+#       driven manually, exactly as before this script could launch
+#       gs-netcat on its own:
+#         gs-netcat -s <secret> -l -e /path/to/gs-transfer.sh
+#       (see the GSTRANSFER_WORKER check below - that path never sets -l,
+#       it re-execs this same script with no args at all).
+#
+#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] ls [path]
+#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] get <remote-path> [local-path]
+#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] put <local-path> [remote-path]
+#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] pwd
+#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] mkdir <remote-path>
+#       Client mode (default, no -l). pwd reports the responder's own
+#       starting directory - what "." means on the wire. mkdir always
+#       creates the whole tree (mkdir -p semantics) - the responder's
+#       MKDIR already works that way unconditionally (see do_mkdir's own
+#       comment), so there's no flag needed to ask for it.
 #
 # get/put take independent local and remote paths (sftp/scp-style) - the
 # local path is whatever this machine's file is actually at (any valid
@@ -52,22 +73,19 @@
 # through to gs-netcat's own GSOCKET_ARGS/interactive prompt handling -
 # same convention as every other gsocket tool.
 #
-# -t sets how long (seconds) to wait for a control-line response before
-# giving up - default 30. Without this, a request the responder never
-# answers (a crash, a protocol mismatch, a dead connection) left this
-# script blocked forever; confirmed and fixed - see the server's own
-# "every request must get a response" comment for the matching
-# root-cause fix on that side. Actual data transfer (a GET/PUT payload)
-# gets its own, larger bound - DATA_TIMEOUT below - since it has to
-# cover the whole file, not just the first byte.
+# -t sets how long (seconds, client only) to wait for a control-line
+# response before giving up - default 30. Without this, a request the
+# responder never answers (a crash, a protocol mismatch, a dead
+# connection) left this script blocked forever. Actual data transfer (a
+# GET/PUT payload) gets its own, larger bound - DATA_TIMEOUT below -
+# since it has to cover the whole file, not just the first byte.
 set -u
 
 # Computed once, not per-check - uname -o spawns a subprocess, and
 # is_safe_partial below can run many times during a transfer. uname -o
 # is a GNU/MSYS/Cygwin extension (absent on macOS/BSD, where the
 # lookup fails safely to "no") - it's what distinguishes a real MSYS/
-# Cygwin environment from a native Linux/macOS one, which is exactly
-# where is_cygwin_symlink below needs to actually do anything.
+# Cygwin environment from a native Linux/macOS one.
 case "$(uname -o 2>/dev/null)" in
 	Msys | Cygwin) IS_MSYS_LIKE=1 ;;
 	*) IS_MSYS_LIKE=0 ;;
@@ -75,24 +93,341 @@ esac
 
 DATA_TIMEOUT=300
 
+# ============================================================================
+# Shared helpers - identical between what used to be the separate client and
+# server scripts, kept as one copy here.
+# ============================================================================
+
+# Deterministic staging path for a GET/PUT target - known in advance,
+# never scanned for. Safety against a planted symlink at this exact,
+# guessable path comes from create_exclusive's atomicity and
+# is_safe_partial's vetting below, not from making the name
+# unpredictable (see ../PROTOCOL.md's "Partial-file safety").
+partial_path() {
+	local target="$1" dir base
+	dir=$(dirname -- "$target")
+	base=$(basename -- "$target")
+	if [[ "$dir" == "." ]]; then
+		printf '.%s.partial\n' "$base"
+	else
+		printf '%s/.%s.partial\n' "$dir" "$base"
+	fi
+}
+
+# On MSYS/Cygwin only: their own symlink emulation (distinct from a
+# native Windows reparse point) represents a symlink as an ordinary
+# file starting with the literal bytes "!<symlink>", followed by a
+# UTF-16LE BOM and the target path - invisible to both Windows itself
+# and to -f/-L, which see nothing but a plain regular file.
+is_cygwin_symlink() {
+	local p="$1"
+	[[ "$IS_MSYS_LIKE" == "1" ]] || return 1
+	[[ "$(head -c 10 -- "$p" 2>/dev/null)" == '!<symlink>' ]]
+}
+
+# A partial is only trustworthy if it's a plain regular file - never a
+# symlink, even one pointing at a legitimate file (it could be swapped
+# out from under us, or planted by another party on a shared
+# directory). is_cygwin_symlink above covers the other kind of
+# "symlink" -L can't see at all.
+is_safe_partial() {
+	local p="$1"
+	[[ -f "$p" && ! -L "$p" ]] || return 1
+	! is_cygwin_symlink "$p"
+}
+
+# Atomically creates $1 only if nothing exists there yet - never
+# follows or overwrites a pre-existing path of any kind, symlink
+# included. This is bash's documented noclobber behavior: the same
+# O_EXCL-style exclusive create mktemp relies on, just at a path we
+# chose ourselves instead of one it randomized - a pre-planted symlink
+# at this exact path is refused outright, not written through.
+create_exclusive() {
+	local p="$1"
+	( set -C; : > "$p" ) 2>/dev/null
+}
+
+# Hash of just the first $2 bytes of $1 - bounded by how much has
+# actually been transferred so far, never the whole file, so resume
+# validation never costs more than the resume itself already did.
+prefix_hash() {
+	local path="$1" n="$2"
+	head -c "$n" -- "$path" | sha256sum | awk '{print $1}'
+}
+
+# ============================================================================
+# Worker mode - gs-netcat's own -e exec'd this same script fresh, with
+# stdin/stdout now wired to the tunnel. Checked first, unconditionally,
+# before any argv parsing: gs-netcat's -e passes no arguments at all, so
+# this has to be detected from the environment/stdin, not from -l. The two
+# signals below (either is enough, see the server-mode header comment for
+# the full rationale) also keep the old manual-launch style working:
+#   gs-netcat -s <secret> -l -e /path/to/gs-transfer.sh
+# ============================================================================
+if [[ "${GSTRANSFER_WORKER:-}" == "1" ]] || [[ -p /dev/stdin ]]; then
+	log() { printf '%s\n' "$*" >&2; }
+
+	# Keeps every path confined to the responder's starting directory - see
+	# ../PROTOCOL.md's "Path rules". Verified against adversarial inputs
+	# (../, absolute, backslash, //, trailing /, bare "..", empty) before
+	# this went anywhere near the actual GET/PUT/LIST handlers.
+	is_safe_path() {
+		local p="$1"
+		[ -n "$p" ] || return 1
+		case "$p" in
+			/* | */ ) return 1 ;;   # absolute, or trailing slash
+			*'\'*) return 1 ;;      # no backslashes - / is the only separator on the wire
+		esac
+		local IFS='/'
+		local -a parts
+		read -ra parts <<< "$p"
+		local seg
+		for seg in "${parts[@]}"; do
+			case "$seg" in
+				"" | ".." ) return 1 ;;
+			esac
+		done
+		return 0
+	}
+
+	# True only if nothing exists at $1, or what's there is a plain regular
+	# file we can safely remove ourselves. Never touches a symlink or
+	# anything else - that might not be ours to remove.
+	reset_partial() {
+		local p="$1"
+		if [ -e "$p" ] || [ -L "$p" ]; then
+			is_safe_partial "$p" || return 1
+			rm -f -- "$p"
+		fi
+		return 0
+	}
+
+	# Reports the responder's own starting directory - what "." on the
+	# wire actually resolves to from the caller's side, since every path
+	# LIST/GET/PUT/MKDIR accepts is relative to it.
+	do_pwd() {
+		printf 'OK %s\n' "$(pwd)"
+	}
+
+	do_list() {
+		local dir="${1:-.}" f base type size mtime
+		if [ "$dir" != "." ]; then
+			if ! is_safe_path "$dir"; then
+				printf 'ERR invalid path\n'
+				return
+			fi
+			if [ ! -d "$dir" ]; then
+				printf 'ERR not found\n'
+				return
+			fi
+		fi
+		for f in "$dir"/*; do
+			[ -e "$f" ] || continue   # unmatched glob (empty directory)
+			base=$(basename -- "$f")
+			if [ -d "$f" ]; then
+				type="D"; size=0
+			elif [ -f "$f" ]; then
+				type="F"
+				size=$(stat --format='%s' -- "$f" 2>/dev/null) || continue
+			else
+				continue   # skip symlinks/devices/etc.
+			fi
+			mtime=$(stat --format='%Y' -- "$f" 2>/dev/null) || continue
+			printf '%s %s %s %s\n' "$type" "$size" "$mtime" "$base"
+		done
+		printf 'END\n'
+	}
+
+	do_get() {
+		local path="$1" offset="${2:-}" claimed_hash="${3:-}" size actual_hash remaining
+		if ! is_safe_path "$path"; then
+			printf 'ERR invalid path\n'
+			return
+		fi
+		if [ ! -f "$path" ]; then
+			printf 'ERR not found\n'
+			return
+		fi
+		size=$(stat --format='%s' -- "$path") || { printf 'ERR stat failed\n'; return; }
+		if [ -z "$offset" ]; then
+			printf 'OK %s\n' "$size"
+			head -c "$size" -- "$path"
+			return
+		fi
+		# Resume request: offset/claimed_hash describe the bytes the client
+		# already has. Only the overlap gets hashed here, never the whole
+		# file - see ../PROTOCOL.md's "Partial-file safety".
+		if ! [[ "$offset" =~ ^[0-9]+$ ]] || [ "$offset" -gt "$size" ]; then
+			printf 'ERR invalid offset\n'
+			return
+		fi
+		actual_hash=$(prefix_hash "$path" "$offset")
+		if [ "$actual_hash" != "$claimed_hash" ]; then
+			printf 'ERR resume mismatch\n'
+			return
+		fi
+		remaining=$((size - offset))
+		printf 'OK %s\n' "$remaining"
+		[ "$remaining" -gt 0 ] && tail -c "+$((offset + 1))" -- "$path"
+	}
+
+	do_mkdir() {
+		local path="$1"
+		if ! is_safe_path "$path"; then
+			printf 'ERR invalid path\n'
+			return
+		fi
+		mkdir -p -- "$path" && printf 'OK\n' || printf 'ERR mkdir failed\n'
+	}
+
+	# PUT is a 4-step handshake, not a single fire-and-forget request -
+	# see ../PROTOCOL.md's "Wire format". Unlike GET, the client can't
+	# unilaterally decide whether to resume: the partial lives on *this*
+	# side, so this side has to offer its state first, before any bytes
+	# flow, which is also why path/size validation can fail here with no
+	# draining needed at all (nothing's been sent yet):
+	#   1. client:  PUT <path> <size>
+	#   2. us:      FRESH | RESUME <offset> <hash> | ERR <reason>
+	#   3. client:  RESTART | RESUME <offset>
+	#   4. client streams <size> bytes (RESTART) or <size-offset> bytes
+	#      (RESUME); us: OK | ERR <reason>
+	do_put() {
+		local path="$1" size="$2" partial offer_offset offer_hash
+		local decision dec_verb dec_offset remaining dir
+
+		if ! is_safe_path "$path" || ! [[ "$size" =~ ^[0-9]+$ ]]; then
+			printf 'ERR invalid path\n'
+			return
+		fi
+
+		partial=$(partial_path "$path")
+		offer_offset=0
+		if is_safe_partial "$partial"; then
+			offer_offset=$(stat --format='%s' -- "$partial" 2>/dev/null) || offer_offset=0
+		fi
+		if [ "$offer_offset" -gt 0 ] && [ "$offer_offset" -le "$size" ]; then
+			offer_hash=$(prefix_hash "$partial" "$offer_offset")
+			printf 'RESUME %s %s\n' "$offer_offset" "$offer_hash"
+		else
+			offer_offset=0
+			printf 'FRESH\n'
+		fi
+
+		if ! read -r decision; then
+			log "gs-transfer: client vanished mid-PUT handshake for '$path'"
+			return
+		fi
+
+		dec_verb=${decision%% *}
+		dec_offset=${decision#"$dec_verb"}
+		dec_offset=${dec_offset# }
+		if [ "$dec_verb" = "RESTART" ]; then
+			dec_offset=0
+		elif [ "$dec_verb" = "RESUME" ] && [[ "$dec_offset" =~ ^[0-9]+$ ]] && [ "$dec_offset" -le "$size" ]; then
+			: # dec_offset already parsed
+		else
+			log "gs-transfer: unexpected PUT handshake reply '$decision'"
+			printf 'ERR unexpected reply\n'
+			return
+		fi
+		remaining=$((size - dec_offset))
+
+		if [ "$dec_verb" = "RESUME" ] && [ "$dec_offset" -gt 0 ] && [ "$dec_offset" = "$offer_offset" ] \
+			&& is_safe_partial "$partial"; then
+			head -c "$remaining" >> "$partial"
+		elif [ "$dec_verb" = "RESUME" ]; then
+			# Client echoed an offset we never offered (stale/confused) -
+			# drain to stay in sync, but don't write anything anywhere: the
+			# incoming bytes are only the *tail* past some offset, never
+			# safe to treat as if they were the whole file.
+			head -c "$remaining" >/dev/null
+			log "gs-transfer: PUT resume offset mismatch for '$path' (offered $offer_offset, client said $dec_offset)"
+			printf 'ERR offset mismatch\n'
+			return
+		else
+			if ! reset_partial "$partial" || ! create_exclusive "$partial"; then
+				head -c "$remaining" >/dev/null
+				printf 'ERR staging blocked\n'
+				return
+			fi
+			head -c "$remaining" > "$partial"
+		fi
+
+		dir=$(dirname -- "$path")
+		[ "$dir" = "." ] || mkdir -p -- "$dir"
+		mv -f -- "$partial" "$path"
+		printf 'OK\n'
+	}
+
+	while IFS= read -r line; do
+		cmd=${line%% *}
+		rest=${line#"$cmd"}
+		rest=${rest# }
+		case "$cmd" in
+			PWD) do_pwd ;;
+			LIST) do_list "$rest" ;;
+			GET)
+				# <path> [<offset> <hash>] - path may itself contain spaces
+				# (already supported elsewhere, e.g. do_list's entries), so
+				# this can only ever split off a trailing "<digits>
+				# <64-hex-chars>" pair, never blindly split the whole line
+				# on whitespace.
+				if [[ "$rest" =~ ^(.*)\ ([0-9]+)\ ([0-9a-f]{64})$ ]]; then
+					do_get "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+				else
+					do_get "$rest" "" ""
+				fi
+				;;
+			MKDIR) do_mkdir "$rest" ;;
+			PUT)
+				# <path> <size> - same reasoning as GET above; a plain
+				# "first space" split (the original implementation, before
+				# resume support) broke on spacey filenames too.
+				if [[ "$rest" =~ ^(.*)\ ([0-9]+)$ ]]; then
+					do_put "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+				else
+					printf 'ERR invalid path\n'
+				fi
+				;;
+			QUIT) log "gs-transfer: QUIT"; exit 0 ;;
+			*)
+				# Every request must get a response, even a bad one - otherwise
+				# the client's read blocks forever waiting for something that
+				# will never arrive.
+				log "gs-transfer: unknown command '$cmd'"
+				printf 'ERR unknown command\n'
+				;;
+		esac
+	done
+	log "gs-transfer: EOF on stdin, exiting"
+	exit 0
+fi
+
+# ============================================================================
+# Argv parsing - shared between server (launcher) mode and client mode.
+# -l is the discriminator: present -> server, absent -> client.
+# ============================================================================
 GS_NETCAT_BIN="gs-netcat"
-# Prefer a gs-netcat sitting next to this script, same lookup blitz uses.
+# Prefer a gs-netcat sitting next to this script.
 BIN="$(cd "$(dirname "${0}")" >/dev/null 2>&1 && pwd)/${GS_NETCAT_BIN}"
 [[ -f "${BIN}" ]] && GS_NETCAT_BIN="${BIN}"
 command -v "${GS_NETCAT_BIN}" >/dev/null 2>&1 || { echo >&2 "${GS_NETCAT_BIN} not found. Check PATH=?"; exit 1; }
 
 usage() {
-	echo >&2 "Usage: $0 [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] ls [path] | get <remote-path> [local-path] | put <local-path> [remote-path]"
+	echo >&2 "Usage: $0 -l [-s <secret>|-k <file>] [-T]"
+	echo >&2 "       $0 [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] ls [path] | get <remote-path> [local-path] | put <local-path> [remote-path] | pwd | mkdir <remote-path>"
 	exit 1
 }
 
+LISTEN=0
 SECRET=""
 SECFILE=""
 USE_TOR=0
 TIMEOUT=30
 RECURSIVE=0
-while getopts ":s:k:Tt:r" opt; do
+while getopts ":ls:k:Tt:r" opt; do
 	case "$opt" in
+		l) LISTEN=1 ;;
 		s) SECRET="$OPTARG" ;;
 		k) SECFILE="$OPTARG" ;;
 		T) USE_TOR=1 ;;
@@ -102,6 +437,39 @@ while getopts ":s:k:Tt:r" opt; do
 	esac
 done
 shift $((OPTIND - 1))
+
+if [[ "$LISTEN" == "1" ]]; then
+	# --- Server (launcher) mode: become gs-netcat -l, which will later
+	# exec a fresh copy of this same script (in worker mode, via -e) for
+	# each connection it accepts. ---
+	GSNC_ARGS=(-l)
+	[[ -n "$SECRET" ]] && GSNC_ARGS+=(-s "$SECRET")
+	[[ -n "$SECFILE" ]] && GSNC_ARGS+=(-k "$SECFILE")
+	[[ "$USE_TOR" == "1" ]] && GSNC_ARGS+=(-T)
+
+	SELF="$(cd "$(dirname "${0}")" >/dev/null 2>&1 && pwd)/$(basename "${0}")"
+	BASH_BIN="$(command -v bash)"
+
+	# -e's value becomes whatever the underlying gs-netcat execs - never
+	# bare "$SELF": a shebang is a #!-line convention the *kernel*
+	# interprets on exec(), which a Windows CreateProcess (what
+	# gs-netcat.exe actually calls) has no concept of at all. Explicitly
+	# naming the interpreter works unconditionally on real POSIX too. Only
+	# the *path style* depends on platform: on MSYS/Cygwin, $SELF and
+	# $BASH_BIN are POSIX-style (/c/Users/...), which Windows'
+	# CreateProcess can't resolve at all - cygpath -w converts both to the
+	# Windows-style path CreateProcess actually needs.
+	if [[ "$IS_MSYS_LIKE" == "1" ]]; then
+		SELF="$(cygpath -w "$SELF")"
+		BASH_BIN="$(cygpath -w "$BASH_BIN")"
+	fi
+	E_VALUE="\"$BASH_BIN\" \"$SELF\""
+
+	export GSTRANSFER_WORKER=1
+	exec "$GS_NETCAT_BIN" "${GSNC_ARGS[@]}" -e "$E_VALUE"
+fi
+
+# --- Client mode (default, no -l) ---
 
 cmd="${1:-}"
 [[ -n "$cmd" ]] || usage
@@ -156,78 +524,9 @@ read_response() {
 	return 0
 }
 
-# Deterministic staging path for a GET/PUT target - known in advance,
-# never scanned for. Safety against a planted symlink at this exact,
-# guessable path comes from create_exclusive's atomicity and
-# is_safe_partial's vetting below, not from making the name
-# unpredictable (see ../PROTOCOL.md's "Partial-file safety").
-partial_path() {
-	local target="$1" dir base
-	dir=$(dirname -- "$target")
-	base=$(basename -- "$target")
-	if [[ "$dir" == "." ]]; then
-		printf '.%s.partial\n' "$base"
-	else
-		printf '%s/.%s.partial\n' "$dir" "$base"
-	fi
-}
-
-# On MSYS/Cygwin only: their own symlink emulation (distinct from a
-# native Windows reparse point) represents a symlink as an ordinary
-# file starting with the literal bytes "!<symlink>", followed by a
-# UTF-16LE BOM and the target path - invisible to both Windows itself
-# and to -f/-L, which see nothing but a plain regular file. Confirmed
-# directly with a hand-built file in this exact format: it passes
-# [[ -f && ! -L ]] cleanly, exactly the gap this closes. Git-for-
-# Windows' own `ln -s` doesn't produce this format (it falls back to a
-# plain copy instead - see is_safe_partial's own comment below), but
-# other MSYS2/Cygwin configurations can, so this only costs a 10-byte
-# read on the platforms where it's actually possible.
-is_cygwin_symlink() {
-	local p="$1"
-	[[ "$IS_MSYS_LIKE" == "1" ]] || return 1
-	[[ "$(head -c 10 -- "$p" 2>/dev/null)" == '!<symlink>' ]]
-}
-
-# A partial is only trustworthy if it's a plain regular file - never a
-# symlink, even one pointing at a legitimate file (it could be swapped
-# out from under us, or planted by another party on a shared
-# directory). Verified directly against a real Windows symlink (made
-# with mklink, since Git-Bash's own `ln -s` silently falls back to
-# copying instead of erroring when it lacks the privilege - a trap that
-# looked like a passing test the first time, without actually testing
-# anything): this correctly tells a plain file apart from a symlink
-# pointing at that same content. is_cygwin_symlink above covers the
-# other kind of "symlink" -L can't see at all.
-is_safe_partial() {
-	local p="$1"
-	[[ -f "$p" && ! -L "$p" ]] || return 1
-	! is_cygwin_symlink "$p"
-}
-
-# Atomically creates $1 only if nothing exists there yet - never
-# follows or overwrites a pre-existing path of any kind, symlink
-# included. This is bash's documented noclobber behavior: the same
-# O_EXCL-style exclusive create mktemp relies on, just at a path we
-# chose ourselves instead of one it randomized - a pre-planted symlink
-# at this exact path is refused outright, not written through.
-create_exclusive() {
-	local p="$1"
-	( set -C; : > "$p" ) 2>/dev/null
-}
-
-# Hash of just the first $2 bytes of $1 - bounded by how much has
-# actually been transferred so far, never the whole file, so resume
-# validation never costs more than the resume itself already did.
-prefix_hash() {
-	local path="$1" n="$2"
-	head -c "$n" -- "$path" | sha256sum | awk '{print $1}'
-}
-
 # Joins a wire-format remote path, collapsing a "." (or empty) base so
 # the result doesn't carry an ugly "./" prefix - "." and "" both mean
-# "the responder's own starting directory" on the wire (see do_list's
-# own "${1:-.}" default and is_safe_path's acceptance of ".").
+# "the responder's own starting directory" on the wire.
 join_path() {
 	local base="$1" name="$2"
 	if [[ -z "$base" || "$base" == "." ]]; then
@@ -239,9 +538,7 @@ join_path() {
 
 # rsync -r trailing-slash semantics: if $src ends with /, its own
 # contents land directly in $dest_root; otherwise $src's basename is
-# appended as an extra destination directory level. Applies identically
-# whether an explicit destination was given or defaulted to "." - see
-# the -r block in the header comment for worked examples.
+# appended as an extra destination directory level.
 effective_dest() {
 	local src="$1" dest_root="${2%/}"
 	[[ -n "$dest_root" ]] || dest_root="."
@@ -294,15 +591,7 @@ remote_walk() {
 		fi
 		printf 'LIST %s\n' "$full" >&4
 		# Fully drain this LIST's response (through END) before invoking
-		# any callback - the wire protocol is strictly request/response,
-		# and the responder doesn't read a new request until it has
-		# finished writing the previous one's entire response. Calling
-		# the callback per-line, before END, let a callback that issues
-		# its own request (GET) collide with this LIST's still-in-flight
-		# remaining entries - confirmed by a loopback test: the GET's
-		# "read the response" call read a trailing LIST entry line
-		# instead, because the responder hadn't even reached the GET
-		# request yet.
+		# any callback - the wire protocol is strictly request/response.
 		ptype=() psize=() pmtime=() prel=()
 		while true; do
 			if ! read -t "$TIMEOUT" -r line <&3; then
@@ -342,8 +631,7 @@ remote_mkdir() {
 }
 
 # Shared single-file GET - used directly by the `get` command and, via
-# recursive_get's get_one callback, by `get -r` too, so resume behaves
-# identically either way. See ../PROTOCOL.md's "Partial-file safety".
+# recursive_get's get_one callback, by `get -r` too.
 do_get_file() {
 	local remote="$1" local_path="$2"
 	local localdir partial offset claimed_hash resp n
@@ -407,9 +695,8 @@ do_get_file() {
 
 # Shared single-file PUT - used directly by the `put` command and, via
 # recursive_put's loop body, by `put -r` too. PUT is a 4-step handshake
-# (see ../PROTOCOL.md's "Wire format") because, unlike GET, the side
-# with the partial (the responder) isn't the side that knows what to do
-# about it (us) - so it has to offer first.
+# because, unlike GET, the side with the partial (the responder) isn't
+# the side that knows what to do about it (us) - so it has to offer first.
 do_put_file() {
 	local local_path="$1" remote="$2"
 	local size resp offer_offset offer_hash local_hash resume_offset remaining
@@ -565,6 +852,24 @@ case "$cmd" in
 			remote="${dest_root:-$(basename -- "$local_raw")}"
 			do_put_file "$local_raw" "$remote"
 		fi
+		;;
+	pwd)
+		printf 'PWD\n' >&4
+		read_response resp || exit 1
+		case "$resp" in
+			OK\ *) echo "${resp#OK }" ;;
+			ERR\ *) echo >&2 "server: ${resp#ERR }"; exit 1 ;;
+			*) echo >&2 "unexpected response: $resp"; exit 1 ;;
+		esac
+		;;
+	mkdir)
+		# No -p flag: the responder's own do_mkdir already runs
+		# `mkdir -p` unconditionally (see its own comment), so every
+		# MKDIR on the wire always creates the whole tree.
+		remote_path="${2:-}"
+		[[ -n "$remote_path" ]] || { echo >&2 "mkdir requires a remote path"; exit 1; }
+		remote_mkdir "$remote_path" || exit 1
+		echo "mkdir $remote_path"
 		;;
 	*)
 		usage
