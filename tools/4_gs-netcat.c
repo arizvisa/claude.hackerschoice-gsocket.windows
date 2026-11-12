@@ -1178,14 +1178,16 @@ do_server(void)
 	 * _GSOCKET_INTERNAL env var, which those unported wrappers set). */
 
 
+	int select_errno;
 	while (1)
 	{
 		n = GS_select(&ctx);
+		select_errno = errno;	/* GS_heartbeat() below may clobber errno */
 		GS_heartbeat(gopt.gsocket);
 		if (n < 0)
 			break;
 	}
-	ERREXIT("NOT REACHED\n");
+	ERREXITC(EX_BADSELECT, "GS_select() failed: %s\n", strerror(select_errno));
 }
 
 /********************** CLIENT *************************************/
@@ -1405,14 +1407,16 @@ do_client(void)
 
 
 	int n;
+	int select_errno;
 	while (1)
 	{
 		n = GS_select(&ctx);
+		select_errno = errno;	/* GS_heartbeat() below may clobber errno */
 		GS_heartbeat(gopt.gsocket);
 		if (n < 0)
 			break;
 	}
-	ERREXIT("NOT REACHED\n");
+	ERREXITC(EX_BADSELECT, "GS_select() failed: %s\n", strerror(select_errno));
 }
 
 static void

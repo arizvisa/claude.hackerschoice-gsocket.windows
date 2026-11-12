@@ -134,18 +134,33 @@ gs_set_nonblock(int fd, int onoff)
 
 #define xfprintf(fp, ...) do {if (fp != NULL) { fprintf(fp, __VA_ARGS__); fflush(fp); } } while (0)
 
+/* A detached CreateThread() worker (see win_childproc.c's reader_thread/writer_thread)
+ * can be parked mid-syscall, possibly holding a CRT/loader lock, at the exact moment
+ * any of the fatal macros below run - exit()'s ExitProcess() has to synchronize with
+ * every other thread before it can finish, and a thread stuck like that is a well-known
+ * way for that to hang forever instead of actually terminating. TerminateProcess kills
+ * the whole process at the OS level unconditionally - no atexit chain, no CRT lock,
+ * nothing left for another thread to block. POSIX's plain exit(code) has no such hazard
+ * (no equivalent "wait for every thread" step), so it's untouched.
+ */
+#ifdef _WIN32
+# define GS_HARD_EXIT(code)  TerminateProcess(GetCurrentProcess(), (code))
+#else
+# define GS_HARD_EXIT(code)  exit(code)
+#endif
+
 #ifdef DEBUG
 # define ERREXIT(...)   do { \
 	xfprintf(gs_errfp, "ERROR "); \
         xfprintf(gs_errfp, "%s():%d ", __func__, __LINE__); \
         xfprintf(gs_errfp, __VA_ARGS__); \
-        exit(255); \
+        GS_HARD_EXIT(255); \
 } while (0)
 #else
 # define ERREXIT(...)   do { \
 	xfprintf(gs_errfp, "ERROR: "); \
         xfprintf(gs_errfp, __VA_ARGS__); \
-        exit(255); \
+        GS_HARD_EXIT(255); \
 } while (0)
 #endif
 
@@ -155,7 +170,7 @@ gs_set_nonblock(int fd, int onoff)
 		xfprintf(gs_errfp, "%s:%d:%s() ASSERT(%s) ", __FILE__, __LINE__, __func__, #expr); \
 		xfprintf(gs_errfp, __VA_ARGS__); \
 		xfprintf(gs_errfp, " Exiting...\n"); \
-		exit(255); \
+		GS_HARD_EXIT(255); \
 	} \
 } while (0)
 #endif

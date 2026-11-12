@@ -315,16 +315,31 @@ extern struct _gopt gopt;
 
 #define XFREE(ptr)  do{if(ptr) free(ptr); ptr = NULL;}while(0)
 
+/* See lib/gs-common.h's matching GS_HARD_EXIT comment: a detached
+ * CreateThread() worker (win_childproc.c's reader_thread/writer_thread) can be
+ * parked mid-syscall, possibly holding a CRT/loader lock, at the exact
+ * moment one of these fires - plain exit() can hang forever synchronizing
+ * with it instead of actually terminating. TerminateProcess kills the whole
+ * process unconditionally, skipping that hazard entirely. CONSOLE_reset()/
+ * stty_reset() still run first (cheap, non-blocking) so an interactive
+ * session's terminal is restored before the hard exit.
+ */
+#ifdef _WIN32
+# define GST_HARD_EXIT(code)  do { CONSOLE_reset(); stty_reset(); TerminateProcess(GetCurrentProcess(), (code)); } while (0)
+#else
+# define GST_HARD_EXIT(code)  exit(code)
+#endif
+
 #define ERREXITC(code, ...)   do { \
 		xfprintf(gopt.err_fp, "ERROR(%d): ", code); \
         xfprintf(gopt.err_fp, __VA_ARGS__); \
-        exit(code); \
+        GST_HARD_EXIT(code); \
 } while (0)
 
 #define ERREXIT(...)   do { \
 		xfprintf(gopt.err_fp, "ERROR: "); \
         xfprintf(gopt.err_fp, __VA_ARGS__); \
-        exit(255); \
+        GST_HARD_EXIT(255); \
 } while (0)
 
 #ifndef XASSERT
@@ -333,7 +348,7 @@ extern struct _gopt gopt;
 		xfprintf(gopt.err_fp, "%s:%d:%s() ASSERT(%s) ", __FILE__, __LINE__, __func__, #expr); \
 		xfprintf(gopt.err_fp, __VA_ARGS__); \
 		xfprintf(gopt.err_fp, " Exiting...\n"); \
-		exit(255); \
+		GST_HARD_EXIT(255); \
 	} \
 } while (0)
 #endif
