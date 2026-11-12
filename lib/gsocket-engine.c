@@ -1031,7 +1031,7 @@ GS_heartbeat(GS *gsocket)
 			}
 			continue;
 		}
-		ERREXIT("NOT REACHED\n");
+		ERREXIT("GS_heartbeat(): sox[%d] in unexpected state %d\n", i, sox->state);
 	}
 }
 

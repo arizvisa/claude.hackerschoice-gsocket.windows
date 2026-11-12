@@ -98,6 +98,7 @@ gs_win_xlate_errno(void)
 		case WSAENOTCONN:     errno = ENOTCONN; break;
 		case WSAETIMEDOUT:    errno = ETIMEDOUT; break;
 		case WSAECONNREFUSED: errno = ECONNREFUSED; break;
+		case WSAENOTSOCK:     errno = EBADF; break;
 		default:              errno = EIO; break;
 	}
 }
