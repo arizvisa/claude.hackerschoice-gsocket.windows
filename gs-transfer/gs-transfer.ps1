@@ -288,9 +288,28 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 		$innerCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
 		$gsncArgs += @("-e", $innerCmd)
 
+		# Scoped to this one listener run: running ./gs-transfer.ps1 directly
+		# in an interactive console executes in that SAME PowerShell process
+		# (no new process the way bash forking a script would), so setting
+		# $env:GSTRANSFER_WORKER here otherwise permanently mutates the
+		# calling session's real environment block - every later invocation
+		# in that same window would see it still "=1", skip this whole
+		# outer-mode block unconditionally (never even checking -Listen),
+		# and fall straight into the worker read-loop on the user's actual
+		# keyboard. The cleanup has to be in a finally, not just the next
+		# statement after `&` - Ctrl+C while the listener is running raises
+		# a pipeline-stop that unwinds straight out of the script, skipping
+		# any cleanup that isn't guaranteed to run during that unwind; a
+		# finally block is - that's the one thing Ctrl+C can't skip.
+		$ncExitCode = 0
 		$env:GSTRANSFER_WORKER = "1"
-		& $netcatExe @gsncArgs
-		exit $LASTEXITCODE
+		try {
+			& $netcatExe @gsncArgs
+			$ncExitCode = $LASTEXITCODE
+		} finally {
+			Remove-Item Env:\GSTRANSFER_WORKER -ErrorAction SilentlyContinue
+		}
+		exit $ncExitCode
 	}
 
 	# ========================================================================
