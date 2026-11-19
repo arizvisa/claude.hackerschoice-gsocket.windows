@@ -816,21 +816,133 @@ function Do-Pwd {
 	Write-Line $stdout "OK $((Get-Location).Path)"
 }
 
-function Do-List([string]$dir) {
+# Shared by Do-List/Do-Recurse: given $dir and an already
+# [StringComparer]::Ordinal-sorted array of names relative to it (bare
+# basenames for Do-List, full /-joined relpaths for Do-Recurse), streams
+# "<type> <size> <mtime> <name>" per entry - honoring an optional
+# <maxcount>/<cursor> page window - then a plain "END" or "MORE <cursor>"
+# if more remain. Sort order must be stable across calls for cursor-
+# skipping to mean anything, which is why both callers force Ordinal
+# comparison rather than Sort-Object's culture-aware default.
+#
+# Cursor matching is exact-equality, never an ordering comparison (a
+# culture-aware -lt/-gt could disagree with the Ordinal sort that
+# produced this list) - skip everything through the entry equal to
+# <cursor>, resume right after. Known, accepted edge case: if the tree
+# changed between pages and <cursor>'s exact value no longer exists, the
+# rest of this page is skipped entirely rather than guessing a nearby
+# resume point.
+function Send-PaginatedListing([string]$dir, [Nullable[int]]$maxcount, [string]$cursor, [string[]]$names) {
+	$skipping = -not [string]::IsNullOrEmpty($cursor)
+	$count = 0
+	$last = $null
+	for ($i = 0; $i -lt $names.Length; $i++) {
+		$name = $names[$i]
+		if ($skipping) {
+			if ($name -eq $cursor) { $skipping = $false }
+			continue
+		}
+		$full = if ($dir -eq ".") { $name } else { Join-Path $dir $name }
+		$item = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
+		if ($null -eq $item) { continue }
+		$mtime = [DateTimeOffset]::new($item.LastWriteTimeUtc, [TimeSpan]::Zero).ToUnixTimeSeconds()
+		if ($item.PSIsContainer) {
+			Write-Line $stdout "D 0 $mtime $name"
+		} else {
+			Write-Line $stdout "F $($item.Length) $mtime $name"
+		}
+		$last = $name
+		$count++
+		if ($maxcount -and $count -ge $maxcount) {
+			# Peek for anything left; each page re-walks from scratch so
+			# discarding this one peeked entry costs nothing - it's simply
+			# re-produced (and re-skipped-past-cursor) next page.
+			if ($i + 1 -lt $names.Length) {
+				Write-Line $stdout "MORE $last"
+				return
+			}
+			break
+		}
+	}
+	Write-Line $stdout "END"
+}
+
+function Do-List([string]$dir, [Nullable[int]]$maxcount, [string]$cursor) {
 	if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
 	if ($dir -ne ".") {
 		if (-not (Test-SafePath $dir)) { Write-Line $stdout "ERR invalid path"; return }
 		if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Write-Line $stdout "ERR not found"; return }
 	}
-	Get-ChildItem -LiteralPath $dir | ForEach-Object {
-		$mtime = [DateTimeOffset]::new($_.LastWriteTimeUtc, [TimeSpan]::Zero).ToUnixTimeSeconds()
-		if ($_.PSIsContainer) {
-			Write-Line $stdout "D 0 $mtime $($_.Name)"
-		} else {
-			Write-Line $stdout "F $($_.Length) $mtime $($_.Name)"
-		}
+	# Dot-prefixed names are excluded - Windows has no equivalent "hidden
+	# by naming convention" rule the way a bare shell glob does on POSIX
+	# (a leading dot alone doesn't set the Hidden attribute here), so
+	# without this, this responder's own .<name>.partial staging files
+	# would leak into listings on Windows but not POSIX.
+	$names = @(Get-ChildItem -LiteralPath $dir | Where-Object { $_.Name -notmatch '(^|/)\.' } | ForEach-Object { $_.Name })
+	[Array]::Sort($names, [StringComparer]::Ordinal)
+	Send-PaginatedListing $dir $maxcount $cursor $names
+}
+
+# Recursive counterpart of Do-List - walks the whole subtree natively
+# (Get-ChildItem -Recurse doesn't follow reparse points/symlinks into a
+# directory by default, same as the single-level Do-List above never has
+# to think about it either) instead of the client doing a BFS via
+# repeated LIST calls. Same dot-prefix exclusion as Do-List, applied to
+# every path segment, not just the leaf name - see its own comment.
+function Do-Recurse([string]$dir, [Nullable[int]]$maxcount, [string]$cursor) {
+	if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
+	if ($dir -ne ".") {
+		if (-not (Test-SafePath $dir)) { Write-Line $stdout "ERR invalid path"; return }
+		if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Write-Line $stdout "ERR not found"; return }
 	}
-	Write-Line $stdout "END"
+	$rootFull = (Resolve-Path -LiteralPath $dir).Path
+	$names = @(Get-ChildItem -LiteralPath $dir -Recurse | ForEach-Object {
+		($_.FullName.Substring($rootFull.Length).TrimStart('\', '/')) -replace '\\', '/'
+	} | Where-Object { $_ -notmatch '(^|/)\.' })
+	[Array]::Sort($names, [StringComparer]::Ordinal)
+	Send-PaginatedListing $dir $maxcount $cursor $names
+}
+
+# Cheap single-path metadata - every field exists to let the client make
+# some specific decision without an extra round trip (see
+# docs/gs-transfer-backend-plan.md for the full per-field reasoning, not
+# just "it was available"): <type> decides GET vs RECURSE/LIST next;
+# <size> decides whether to even attempt a transfer; <mtime> enables
+# sync-style skip-if-unchanged logic; <atime> is included but known-
+# unreliable on both platforms (Windows disables last-access tracking by
+# default since Vista, Linux commonly mounts noatime/relatime) - don't
+# trust it for anything load-bearing; <birthtime> is cleanly available
+# via .CreationTimeUtc (NTFS always tracks it); <file_count>/<dir_count>
+# (immediate children only, directories only - 0/0 for a file) size
+# whether a client should bother paginating a later LIST/RECURSE at all.
+function Do-Stat([string]$path) {
+	if (-not (Test-SafePath $path)) { Write-Line $stdout "ERR invalid path"; return }
+	$item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+	if ($null -eq $item) { Write-Line $stdout "ERR not found"; return }
+	$mtime = [DateTimeOffset]::new($item.LastWriteTimeUtc, [TimeSpan]::Zero).ToUnixTimeSeconds()
+	$atime = [DateTimeOffset]::new($item.LastAccessTimeUtc, [TimeSpan]::Zero).ToUnixTimeSeconds()
+	$btime = [DateTimeOffset]::new($item.CreationTimeUtc, [TimeSpan]::Zero).ToUnixTimeSeconds()
+	if ($item.PSIsContainer) {
+		$children = @(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '(^|/)\.' })
+		$fileCount = @($children | Where-Object { -not $_.PSIsContainer }).Count
+		$dirCount = @($children | Where-Object { $_.PSIsContainer }).Count
+		Write-Line $stdout "OK D 0 $mtime $atime $btime $fileCount $dirCount"
+	} else {
+		Write-Line $stdout "OK F $($item.Length) $mtime $atime $btime 0 0"
+	}
+}
+
+# Deliberately separate from Do-Stat, not an optional extra on it -
+# reading a whole file to hash it costs O(file size), the opposite of
+# Do-Stat's cheap-lookup nature. Reuses Get-PrefixHash completely
+# unchanged: hashing the whole file is just n = the full size instead of
+# a resume offset, not new crypto code.
+function Do-Hash([string]$path) {
+	if (-not (Test-SafePath $path)) { Write-Line $stdout "ERR invalid path"; return }
+	if (Test-Path -LiteralPath $path -PathType Container) { Write-Line $stdout "ERR is a directory"; return }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Write-Line $stdout "ERR not found"; return }
+	$hash = Get-PrefixHash $path (Get-Item -LiteralPath $path).Length
+	Write-Line $stdout "OK $hash"
 }
 
 function Do-Get([string]$path, [string]$offsetStr, [string]$claimedHash) {
@@ -972,7 +1084,35 @@ while ($true) {
 	$cmd = $parts[0]
 	switch ($cmd) {
 		"PWD"  { Do-Pwd }
-		"LIST" { Do-List $(if ($parts.Length -gt 1) { $parts[1] } else { "" }) }
+		"LIST" {
+			# [<path>] [<maxcount> [<cursor>]] - same trailing-field-
+			# peeling idiom as GET/PUT below; <cursor> is free-form (may
+			# itself contain spaces/slashes), so it's only ever
+			# "whatever's left after peeling a leading <maxcount>
+			# token", never split further itself.
+			$rest = if ($parts.Length -gt 1) { $parts[1] } else { "" }
+			if ($rest -match '^(.*) (\d+) (.+)$') {
+				Do-List $matches[1] ([int]$matches[2]) $matches[3]
+			} elseif ($rest -match '^(.*) (\d+)$') {
+				Do-List $matches[1] ([int]$matches[2]) $null
+			} else {
+				Do-List $rest $null $null
+			}
+		}
+		"RECURSE" {
+			# <path> [<maxcount> [<cursor>]] - identical parsing shape to
+			# LIST above, see its own comment.
+			$rest = if ($parts.Length -gt 1) { $parts[1] } else { "" }
+			if ($rest -match '^(.*) (\d+) (.+)$') {
+				Do-Recurse $matches[1] ([int]$matches[2]) $matches[3]
+			} elseif ($rest -match '^(.*) (\d+)$') {
+				Do-Recurse $matches[1] ([int]$matches[2]) $null
+			} else {
+				Do-Recurse $rest $null $null
+			}
+		}
+		"STAT" { Do-Stat $(if ($parts.Length -gt 1) { $parts[1] } else { "" }) }
+		"HASH" { Do-Hash $(if ($parts.Length -gt 1) { $parts[1] } else { "" }) }
 		"GET"  {
 			# <path> [<offset> <hash>] - path may itself contain spaces
 			# (already supported elsewhere, e.g. Do-List's entries), so

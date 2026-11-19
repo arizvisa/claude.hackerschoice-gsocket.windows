@@ -209,8 +209,67 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]] || [[ -p /dev/stdin ]]; then
 		printf 'OK %s\n' "$(pwd)"
 	}
 
+	# Shared by do_list/do_recurse: reads a newline-separated, already
+	# LC_ALL=C-sorted list of names relative to $dir from stdin (bare
+	# basenames for do_list, full /-joined relpaths for do_recurse), and
+	# streams "<type> <size> <mtime> <name>" per entry - honoring an
+	# optional <maxcount>/<cursor> page window - then a plain "END" or
+	# "MORE <cursor>" if more remain. Sort order must be stable across
+	# calls for cursor-skipping to mean anything, which is why the two
+	# callers both force LC_ALL=C rather than the locale-dependent default.
+	#
+	# Cursor matching is exact-equality, never an ordering comparison
+	# ([[ a < b ]] in bash is itself locale-collation-dependent, which
+	# would silently disagree with the LC_ALL=C sort that produced this
+	# list) - skip everything through the line equal to <cursor>, resume
+	# right after. Known, accepted edge case: if the tree changed between
+	# pages and <cursor>'s exact value no longer exists, the rest of this
+	# page is skipped entirely (nothing after it will ever match) rather
+	# than guessing a nearby resume point - same "document it, don't
+	# engineer around it" spirit as this file's other edge-case notes.
+	emit_paginated_listing() {
+		local dir="$1" maxcount="$2" cursor="$3"
+		local name full type size mtime count=0 last="" skipping=0 next_name
+		[ -n "$cursor" ] && skipping=1
+		while IFS= read -r name; do
+			[ -n "$name" ] || continue
+			if [ "$skipping" = "1" ]; then
+				[ "$name" = "$cursor" ] && skipping=0
+				continue
+			fi
+			if [ "$dir" = "." ]; then
+				full="$name"
+			else
+				full="$dir/$name"
+			fi
+			if [ -d "$full" ]; then
+				type="D"; size=0
+			elif [ -f "$full" ]; then
+				type="F"
+				size=$(stat --format='%s' -- "$full" 2>/dev/null) || continue
+			else
+				continue   # skip symlinks/devices/etc.
+			fi
+			mtime=$(stat --format='%Y' -- "$full" 2>/dev/null) || continue
+			printf '%s %s %s %s\n' "$type" "$size" "$mtime" "$name"
+			last="$name"
+			count=$((count + 1))
+			if [ -n "$maxcount" ] && [ "$count" -ge "$maxcount" ]; then
+				# Peek for anything left; each page re-walks from scratch
+				# so discarding this one peeked line costs nothing - it's
+				# simply re-produced (and re-skipped-past-cursor) next page.
+				if IFS= read -r next_name; then
+					printf 'MORE %s\n' "$last"
+					return
+				fi
+				break
+			fi
+		done
+		printf 'END\n'
+	}
+
 	do_list() {
-		local dir="${1:-.}" f base type size mtime
+		local dir="${1:-.}" maxcount="${2:-}" cursor="${3:-}" f
 		if [ "$dir" != "." ]; then
 			if ! is_safe_path "$dir"; then
 				printf 'ERR invalid path\n'
@@ -221,21 +280,109 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]] || [[ -p /dev/stdin ]]; then
 				return
 			fi
 		fi
-		for f in "$dir"/*; do
-			[ -e "$f" ] || continue   # unmatched glob (empty directory)
-			base=$(basename -- "$f")
-			if [ -d "$f" ]; then
-				type="D"; size=0
-			elif [ -f "$f" ]; then
-				type="F"
-				size=$(stat --format='%s' -- "$f" 2>/dev/null) || continue
-			else
-				continue   # skip symlinks/devices/etc.
+		emit_paginated_listing "$dir" "$maxcount" "$cursor" < <(
+			for f in "$dir"/*; do
+				[ -e "$f" ] || continue   # unmatched glob (empty directory)
+				basename -- "$f"
+			done | LC_ALL=C sort
+		)
+	}
+
+	# Recursive counterpart of do_list - walks the whole subtree natively
+	# (never follows symlinks by default, same as the glob loop above
+	# never descends into one either) instead of the client doing a BFS
+	# via repeated LIST calls. Dotfiles/dotdirs (at any depth) are
+	# excluded explicitly, since find has no such built-in convention the
+	# way a bare glob does - do_list's "$dir"/* loop already hides them
+	# for free via bash's own default (non-dotglob) glob behavior, and
+	# this must match that, not least because it's what keeps this
+	# project's own .<name>.partial staging files from leaking into a
+	# recursive listing.
+	do_recurse() {
+		local dir="${1:-.}" maxcount="${2:-}" cursor="${3:-}"
+		if [ "$dir" != "." ]; then
+			if ! is_safe_path "$dir"; then
+				printf 'ERR invalid path\n'
+				return
 			fi
-			mtime=$(stat --format='%Y' -- "$f" 2>/dev/null) || continue
-			printf '%s %s %s %s\n' "$type" "$size" "$mtime" "$base"
-		done
-		printf 'END\n'
+			if [ ! -d "$dir" ]; then
+				printf 'ERR not found\n'
+				return
+			fi
+		fi
+		emit_paginated_listing "$dir" "$maxcount" "$cursor" < <(
+			find "$dir" -mindepth 1 -printf '%P\n' 2>/dev/null | while IFS= read -r p; do
+				case "/$p" in
+					*/.*) continue ;;   # dotfile/dotdir at any depth
+				esac
+				printf '%s\n' "$p"
+			done | LC_ALL=C sort
+		)
+	}
+
+	# Cheap single-path metadata - every field exists to let the client
+	# make some specific decision without an extra round trip (see
+	# docs/gs-transfer-backend-plan.md for the full per-field reasoning,
+	# not just "it was available"): <type> decides GET vs
+	# RECURSE/LIST next; <size> decides whether to even attempt a
+	# transfer; <mtime> enables sync-style skip-if-unchanged logic;
+	# <atime> is included but known-unreliable on both platforms (Linux
+	# noatime/relatime, Windows disables last-access tracking by default
+	# since Vista) - don't trust it for anything load-bearing; <birthtime>
+	# is GNU stat's own "%W ... 0 if unknown" fallback passed straight
+	# through, no translation needed; <file_count>/<dir_count> (immediate
+	# children only, directories only - 0/0 for a file) size whether a
+	# client should bother paginating a later LIST/RECURSE at all.
+	do_stat() {
+		local path="$1" type size mtime atime btime file_count=0 dir_count=0 f
+		if ! is_safe_path "$path"; then
+			printf 'ERR invalid path\n'
+			return
+		fi
+		if [ -d "$path" ]; then
+			type="D"; size=0
+			for f in "$path"/*; do
+				[ -e "$f" ] || continue
+				if [ -d "$f" ]; then
+					dir_count=$((dir_count + 1))
+				elif [ -f "$f" ]; then
+					file_count=$((file_count + 1))
+				fi
+			done
+		elif [ -f "$path" ]; then
+			type="F"
+			size=$(stat --format='%s' -- "$path" 2>/dev/null) || { printf 'ERR stat failed\n'; return; }
+		else
+			printf 'ERR not found\n'
+			return
+		fi
+		mtime=$(stat --format='%Y' -- "$path" 2>/dev/null) || { printf 'ERR stat failed\n'; return; }
+		atime=$(stat --format='%X' -- "$path" 2>/dev/null) || atime=0
+		btime=$(stat --format='%W' -- "$path" 2>/dev/null) || btime=0
+		printf 'OK %s %s %s %s %s %s %s\n' "$type" "$size" "$mtime" "$atime" "$btime" "$file_count" "$dir_count"
+	}
+
+	# Deliberately separate from do_stat, not an optional extra on it -
+	# reading a whole file to hash it costs O(file size), the opposite of
+	# do_stat's cheap-lookup nature. Reuses prefix_hash completely
+	# unchanged: hashing the whole file is just n = the full size instead
+	# of a resume offset, not new crypto code.
+	do_hash() {
+		local path="$1" size
+		if ! is_safe_path "$path"; then
+			printf 'ERR invalid path\n'
+			return
+		fi
+		if [ -d "$path" ]; then
+			printf 'ERR is a directory\n'
+			return
+		fi
+		if [ ! -f "$path" ]; then
+			printf 'ERR not found\n'
+			return
+		fi
+		size=$(stat --format='%s' -- "$path" 2>/dev/null) || { printf 'ERR stat failed\n'; return; }
+		printf 'OK %s\n' "$(prefix_hash "$path" "$size")"
 	}
 
 	do_get() {
@@ -365,7 +512,33 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]] || [[ -p /dev/stdin ]]; then
 		rest=${rest# }
 		case "$cmd" in
 			PWD) do_pwd ;;
-			LIST) do_list "$rest" ;;
+			LIST)
+				# [<path>] [<maxcount> [<cursor>]] - same trailing-field-
+				# peeling idiom as GET/PUT below; <cursor> is free-form (may
+				# itself contain spaces/slashes), so it's only ever
+				# "whatever's left after peeling a leading <maxcount>
+				# token", never split further itself.
+				if [[ "$rest" =~ ^(.*)\ ([0-9]+)\ (.+)$ ]]; then
+					do_list "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+				elif [[ "$rest" =~ ^(.*)\ ([0-9]+)$ ]]; then
+					do_list "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" ""
+				else
+					do_list "$rest" "" ""
+				fi
+				;;
+			RECURSE)
+				# <path> [<maxcount> [<cursor>]] - identical parsing shape
+				# to LIST above, see its own comment.
+				if [[ "$rest" =~ ^(.*)\ ([0-9]+)\ (.+)$ ]]; then
+					do_recurse "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+				elif [[ "$rest" =~ ^(.*)\ ([0-9]+)$ ]]; then
+					do_recurse "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" ""
+				else
+					do_recurse "$rest" "" ""
+				fi
+				;;
+			STAT) do_stat "$rest" ;;
+			HASH) do_hash "$rest" ;;
 			GET)
 				# <path> [<offset> <hash>] - path may itself contain spaces
 				# (already supported elsewhere, e.g. do_list's entries), so

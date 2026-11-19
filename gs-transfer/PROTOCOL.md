@@ -125,27 +125,37 @@ a file's own content can never be confused with protocol framing.
 ### Requests (client -> responder)
 
 ```
-LIST [path]
+LIST [path] [<maxcount> [<cursor>]]
+RECURSE <path> [<maxcount> [<cursor>]]
 GET <path> [<offset> <hash>]
 PUT <path> <size>
 MKDIR <path>
+STAT <path>
+HASH <path>
 QUIT
 ```
 `LIST` with no argument lists the responder's current working directory;
-`LIST <path>` lists a subdirectory relative to it. `<path>` in
-`GET`/`PUT`/`MKDIR` may include `/`-separated subdirectories (e.g.
-`logs/2026-11-01.txt`) - see **Path rules** below for exactly what's
-allowed. `GET`'s optional `<offset> <hash>` is a resume request - see
-**Resume and partial-file safety** below; plain `GET <path>` is still a
-complete, from-scratch request exactly as always. A `PUT` request line
-is *not* immediately followed by data the way it used to be - see the
-same section for the handshake that now sits in between. `MKDIR <path>`
-creates a directory, plus any missing intermediate parents
-(`mkdir -p`-equivalent, same as `PUT`'s own auto-created parent
-directories). It exists so a recursive upload can preserve an empty
-directory - a plain `PUT` only ever creates the parents of a file it's
-actually writing, so a directory with nothing in it would otherwise be
-silently dropped.
+`LIST <path>` lists a subdirectory relative to it. `RECURSE <path>` walks
+the whole subtree under `<path>` instead of just its immediate children -
+see **Pagination (LIST, RECURSE)** below for `<maxcount>`/`<cursor>` on
+both verbs, and **Scope / accepted limitations** for why `-r` (the
+client's own recursion flag) doesn't use `RECURSE` yet. `<path>` in
+`GET`/`PUT`/`MKDIR`/`RECURSE`/`STAT`/`HASH` may include `/`-separated
+subdirectories (e.g. `logs/2026-11-01.txt`) - see **Path rules** below for
+exactly what's allowed. `GET`'s optional `<offset> <hash>` is a resume
+request - see **Resume and partial-file safety** below; plain
+`GET <path>` is still a complete, from-scratch request exactly as always.
+A `PUT` request line is *not* immediately followed by data the way it
+used to be - see the same section for the handshake that now sits in
+between. `MKDIR <path>` creates a directory, plus any missing
+intermediate parents (`mkdir -p`-equivalent, same as `PUT`'s own
+auto-created parent directories). It exists so a recursive upload can
+preserve an empty directory - a plain `PUT` only ever creates the parents
+of a file it's actually writing, so a directory with nothing in it would
+otherwise be silently dropped. `STAT <path>` reports cheap metadata for
+one path directly, without listing its parent - see **`STAT`** below.
+`HASH <path>` is a separate, deliberately expensive full-content SHA256 -
+see **`HASH`** below for why it isn't just another `STAT` field.
 
 Note: `<path>` here is always the single *remote* path - there's no
 concept of a local path at the wire-protocol level at all. A client tool
@@ -157,7 +167,9 @@ something the wire format needs to know about.
 ### Responses (responder -> client)
 
 ```
-LIST success   : zero or more "<type> <size> <mtime> <name>" lines, then "END"
+LIST/RECURSE success : zero or more "<type> <size> <mtime> <name>" lines, then
+                        one of "END" (no more pages) | "MORE <cursor>" (more
+                        remain, see Pagination below) | "ERR <reason>"
 GET success    : "OK <n>" followed by exactly <n> raw bytes - <n> is the
                   full file size for a plain GET, or just the remaining
                   bytes for a resume GET (see below)
@@ -166,6 +178,10 @@ PUT, step 1    : "FRESH" | "RESUME <offset> <hash>" | "ERR <reason>"
 PUT, step 2    : (final) "OK" | "ERR <reason>"
 MKDIR success  : "OK"
 MKDIR failure  : "ERR <reason>"
+STAT success   : "OK <type> <size> <mtime> <atime> <birthtime> <file_count> <dir_count>"
+STAT failure   : "ERR not found" | "ERR invalid path"
+HASH success   : "OK <sha256-hex>"
+HASH failure   : "ERR not found" | "ERR invalid path" | "ERR is a directory"
 QUIT           : no response - the responder process exits, which ends the
                  gs-netcat -e child and tears down the tunnel session
 ```
@@ -174,16 +190,107 @@ safety** for the full 4-step exchange this implies.
 
 `<type>` is `F` (regular file) or `D` (subdirectory) - entries of any
 other type (symlinks, devices, etc.) are omitted. `<size>` is a decimal
-byte count (`0` for directories - their size isn't meaningful here).
-`<mtime>` is a decimal Unix timestamp. `<name>` in a `LIST` response is
-always a bare name (no path prefix), relative to whatever directory was
-listed.
+byte count (`0` for directories - their size isn't meaningful here, and
+for `STAT` on a directory too, same placeholder convention). `<mtime>` is
+a decimal Unix timestamp. `<name>` in a `LIST` response is always a bare
+name (no path prefix), relative to whatever directory was listed; in a
+`RECURSE` response it's a path relative to the requested `<path>` and may
+itself contain `/` - the existing line parser already treats everything
+after the 3rd space as an opaque name, so this needed no new parsing
+shape on the client side, only the new verb and terminator.
+
+### `STAT`
+
+```
+STAT <path>  ->  OK <type> <size> <mtime> <atime> <birthtime> <file_count> <dir_count>
+             |   ERR not found | ERR invalid path
+```
+Every field exists for a specific client *decision*, not just because
+it's available metadata - full reasoning per field in
+`docs/gs-transfer-backend-plan.md` (kept local, not part of this repo).
+Short version: `<type>` picks `GET` vs `LIST`/`RECURSE` next; `<size>`
+decides whether to even attempt a transfer before spending a round trip
+on `GET`; `<mtime>` enables sync-style skip-if-unchanged logic; `<atime>`
+is included but known-unreliable on both platforms (Linux commonly mounts
+`noatime`/`relatime`, Windows has disabled last-access tracking by
+default since Vista) - don't rely on it for anything load-bearing;
+`<birthtime>` is creation time, cleanly available both sides (`0` if a
+POSIX filesystem can't report it - GNU `stat`'s own `%W` fallback, passed
+straight through); `<file_count>`/`<dir_count>` are the directory's
+*immediate* children only (both `0` for a file) - never a recursive
+total, which would need exactly the kind of full walk pagination exists
+to avoid.
+
+Deliberately excluded, not oversights: symlink visibility (a symlinked
+path reports `ERR not found`, same as `LIST`/`RECURSE` already treat
+symlinks as invisible); `ctime`/metadata-change-time (no faithful
+Windows/.NET equivalent to expose); permissions/ownership (this
+protocol's trust model has no partial-access concept); a "does a
+`.partial` already exist" pre-check (already free via `PUT`'s own
+`FRESH`/`RESUME` handshake).
+
+### `HASH`
+
+```
+HASH <path>  ->  OK <sha256-hex>
+             |   ERR not found | ERR invalid path | ERR is a directory
+```
+Deliberately a separate verb from `STAT`, not an optional extra on it:
+reading an entire file to hash it costs O(file size), the opposite of
+`STAT`'s cheap-lookup nature - folding it in would make every `STAT`
+call's cost unpredictable depending on whether a hash was requested.
+Reuses the same SHA256 machinery `GET`/`PUT` resume validation already
+uses (hashing the whole file is just that function called with the full
+file size instead of a resume offset, not new crypto code). A client
+reading `HASH`'s response needs the same `DATA_TIMEOUT` bound a `GET`/
+`PUT` data phase gets, not the shorter control-line timeout - hashing
+scales with file size the same way a transfer's duration does.
+
+### Pagination (`LIST`, `RECURSE`)
+
+Both verbs accept the same optional trailing fields:
+
+```
+LIST [path]                          -> everything, one response, ends in plain END (unchanged from before pagination existed)
+LIST <path> <maxcount>               -> first page: up to <maxcount> entries
+LIST <path> <maxcount> <cursor>      -> next page: resume strictly after <cursor>
+RECURSE <path>                       -> everything under <path>, same shape
+RECURSE <path> <maxcount>            -> first page
+RECURSE <path> <maxcount> <cursor>   -> next page
+```
+Exists because a single request returning an unbounded amount of data is
+a problem independent of recursion - a flat directory with tens of
+thousands of files hits it through plain `LIST` just as much as a deep
+tree does through `RECURSE`. Omitting both fields is byte-for-byte
+identical to how `LIST` always behaved before this existed.
+
+Each page is a **fresh, stateless walk**, not a held-open server-side
+session: the responder sorts the full candidate list, skips everything
+through the entry equal to `<cursor>` (exact match, never an ordering
+comparison - see below), and streams up to `<maxcount>` entries from
+there. This mirrors `GET`'s own resume mechanism - the client echoes a
+marker, the responder re-derives its position from that marker alone,
+nothing is remembered between requests.
+
+**Sort order must be stable across calls**, or cursor-skipping resumes
+from the wrong place - both responders force plain byte-ordinal
+lexicographic comparison on the full name/relpath explicitly
+(`LC_ALL=C sort` on POSIX, `[System.StringComparer]::Ordinal` on
+Windows), never the locale/culture-aware default either language's
+`sort`/`Sort-Object` normally uses. Accepted, documented-not-solved edge
+case, same spirit as this file's Cygwin-symlink caveat below: non-ASCII
+names aren't guaranteed byte-for-byte identically ordered between a
+POSIX responder (UTF-8 byte order) and a Windows one (UTF-16 code-unit
+order). Separately: if the tree changes between pages and `<cursor>`'s
+exact value no longer exists, the rest of that page is skipped entirely
+rather than guessing a nearby resume point.
 
 ### Path rules
 
 Applied identically by both responders (`gs-transfer-server.sh`,
-`gs-transfer-server.ps1`) to every `path` in `LIST`/`GET`/`PUT`/`MKDIR`, to
-stay within the responder's starting directory:
+`gs-transfer-server.ps1`) to every `path` in
+`LIST`/`RECURSE`/`GET`/`PUT`/`MKDIR`/`STAT`/`HASH`, to stay within the
+responder's starting directory:
 
 - Must be relative - no leading `/` (or a drive letter/`\\` on Windows).
 - No `..` path component, anywhere in the path.
@@ -453,12 +560,13 @@ Deliberately minimal, matching this tool's "very minimalistic" brief:
 
 - Filenames must not contain newlines (undefined behavior if they do -
   not escaped/validated beyond that).
-- No recursion at the wire level - `-r` (see **Recursion** above) is
-  entirely a client-side construction on top of plain
-  `LIST`/`GET`/`PUT`/`MKDIR`; the protocol itself only ever transfers one
-  file or lists one directory per request. No server-side glob
-  expansion - a client can glob locally (shell globbing) and issue one
-  `PUT`/`GET` per matched file.
+- `RECURSE` (see **Wire format** above) does walk server-side, but `-r`
+  (see **Recursion** above) doesn't use it yet - it's still built
+  entirely client-side out of repeated `LIST` calls, unchanged by
+  `RECURSE`'s addition. Switching `-r` over is planned (see
+  `docs/gs-transfer-backend-plan.md`, kept local, not part of this repo),
+  not done. No server-side glob expansion - a client can glob locally
+  (shell globbing) and issue one `PUT`/`GET` per matched file.
 - Resume (see **Resume and partial-file safety** above) only ever
   validates the already-transferred overlap, never the whole finished
   file, and only ever resumes a byte-for-byte contiguous prefix - there's
