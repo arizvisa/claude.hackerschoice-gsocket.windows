@@ -319,9 +319,21 @@ run_server(GS_CTX *gs_ctx, GS_ADDR *addr, const char *target_ip, int target_port
 
 	for (;;)
 	{
-		GS *gs = GS_accept(listener, NULL);
+		int err = 0;
+		GS *gs = GS_accept(listener, &err);
 		if (gs == NULL)
 		{
+			/* err <= -2 (GS_ERR_FATAL) means retrying is pointless - e.g.
+			 * BAD_AUTH ("Address already in use"): the GSRN already told
+			 * us this listener can never succeed, and calling
+			 * GS_accept() again would just re-enter gs_accept_blocking()'s
+			 * select()-timeout loop on this now-dead socket forever (it
+			 * already delivered its one FATAL status packet, so it never
+			 * becomes ready again) - a silent, permanent hang with no
+			 * further output. Mirrors gs-netcat's own cb_listen() check.
+			 */
+			if (err <= -2)
+				die("GS_accept(): %s\n", GS_strerror(listener));
 			fprintf(stderr, "GS_accept(): %s\n", GS_strerror(listener));
 			continue;
 		}
