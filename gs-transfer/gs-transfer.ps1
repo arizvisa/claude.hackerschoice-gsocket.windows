@@ -15,20 +15,25 @@
 #       also still be driven manually, exactly as before:
 #         gs-netcat.exe -s <secret> -l -e "powershell.exe -NoProfile -ExecutionPolicy Bypass -File gs-transfer.ps1"
 #
-#   gs-transfer.ps1 [-Secret <secret>] [-SecretFile <file>] [-Tor] [-Timeout <seconds>] [-Recursive] ls [path]
-#   gs-transfer.ps1 [-Secret <secret>] [-SecretFile <file>] [-Tor] [-Timeout <seconds>] [-Recursive] get <remote-path> [local-path]
-#   gs-transfer.ps1 [-Secret <secret>] [-SecretFile <file>] [-Tor] [-Timeout <seconds>] [-Recursive] put <local-path> [remote-path]
+#   gs-transfer.ps1 [-Secret <secret>] [-SecretFile <file>] [-Tor] [-Timeout <seconds>] ls [-Recursive] [-FullPath] [path]
+#   gs-transfer.ps1 [-Secret <secret>] [-SecretFile <file>] [-Tor] [-Timeout <seconds>] get [-Recursive] <remote-path> [local-path]
+#   gs-transfer.ps1 [-Secret <secret>] [-SecretFile <file>] [-Tor] [-Timeout <seconds>] put [-Recursive] <local-path> [remote-path]
 #   gs-transfer.ps1 [-Secret <secret>] [-SecretFile <file>] [-Tor] [-Timeout <seconds>] pwd
 #   gs-transfer.ps1 [-Secret <secret>] [-SecretFile <file>] [-Tor] [-Timeout <seconds>] mkdir <remote-path>
+#   gs-transfer.ps1 [-Secret <secret>] [-SecretFile <file>] [-Tor] [-Timeout <seconds>] stat [path]
 #       Client mode (default, no -Listen). pwd reports the responder's
 #       own starting directory - what "." means on the wire. mkdir
 #       always creates the whole tree (mkdir -p semantics) - Do-Mkdir on
 #       the responder side already works that way unconditionally (see
-#       its own comment), so there's no flag needed to ask for it.
+#       its own comment), so there's no flag needed to ask for it. stat
+#       prints type/size/mtime/atime/birthtime, plus immediate file/dir
+#       counts for a directory - a single STAT request, no LIST/RECURSE
+#       pagination involved.
 #
 # Every parameter also has a single-letter alias matching the POSIX
-# script's getopts flag (-l/-s/-k/-T/-r), so the two are driven
-# identically where PowerShell's own parameter-binding allows it. -Timeout
+# script's getopts flag (-l/-s/-k/-T/-r/-1... i.e. -FullPath), so the two
+# are driven identically where PowerShell's own parameter-binding allows
+# it. -Timeout
 # has no such alias: PowerShell resolves parameter aliases
 # case-insensitively, so a "t" alias on -Timeout would collide with -Tor's
 # "T" (both normalize to the same key) and PowerShell throws an ambiguous-
@@ -46,6 +51,19 @@
 # becomes an extra destination directory level - see
 # ../posix/gs-transfer.sh's header comment for the worked examples
 # (identical semantics here).
+#
+# -Recursive/-FullPath are shown above after the subcommand, to match
+# ../posix/gs-transfer.sh's own getopts-enforced ordering there - but
+# PowerShell's own parameter binder doesn't actually enforce that: it
+# resolves named/aliased tokens wherever they appear and fills Command/
+# Arg1/Arg2 positionally from whatever's left, so `get -r remote local`
+# and `get remote local -Recursive` bind identically either way. There
+# is also no "--" end-of-options sentinel here, unlike the POSIX
+# script - "--" isn't special to this script's own parameter binding
+# (PowerShell's "--%" stop-parsing operator only applies when calling a
+# native executable, not this script's own declared parameters), so a
+# remote/local path that itself starts with "-" has no literal escape
+# on this side yet.
 #
 # get/put resume automatically whenever an interrupted attempt left a
 # usable partial behind - no flag needed. See ../PROTOCOL.md's
@@ -65,6 +83,7 @@ param(
 	[Alias("T")][switch]$Tor,
 	[int]$Timeout = 30,
 	[Alias("r")][switch]$Recursive,
+	[Alias("1")][switch]$FullPath,
 	[Parameter(Position = 0)][string]$Command,
 	[Parameter(Position = 1)][string]$Arg1,
 	[Parameter(Position = 2)][string]$Arg2,
@@ -77,11 +96,17 @@ param(
 # missing or unrecognized, and for an explicit -Help, instead of each call
 # site keeping its own (previously out-of-sync) copy.
 function Show-Usage {
-	Write-Error "Usage: $PSCommandPath -Listen [-Secret <secret>|-SecretFile <file>] [-Tor]"
-	Write-Error "       $PSCommandPath [-Secret <secret>|-SecretFile <file>] [-Tor] [-Timeout <sec>] [-Recursive] ls [path] | get <remote-path> [local-path] | put <local-path> [remote-path] | pwd | mkdir <remote-path>"
+	Write-Err "Usage: $PSCommandPath -Listen [-Secret <secret>|-SecretFile <file>] [-Tor]"
+	Write-Err "       $PSCommandPath [-Secret <secret>|-SecretFile <file>] [-Tor] [-Timeout <sec>] ls [-Recursive] [-FullPath] [path] | get [-Recursive] <remote-path> [local-path] | put [-Recursive] <local-path> [remote-path] | pwd | mkdir <remote-path> | stat [path]"
 }
 
 $DataTimeout = 300
+# Not exposed as a flag, same reasoning as $DataTimeout above: rarely the
+# right thing to tune per-invocation. Used as <maxcount> for every
+# LIST/RECURSE call this client makes - large enough that a typical
+# directory completes in one round trip, small enough to bound
+# worst-case response size for a pathological one.
+$PageSize = 1000
 
 if ($Help) {
 	Show-Usage
@@ -221,6 +246,26 @@ function Write-Line([System.IO.Stream]$stream, [string]$text) {
 	$stream.Flush()
 }
 
+# Plain stdout/stderr writes for launcher and client mode's own
+# human-readable status output - deliberately not Write-Host/Write-Error.
+# Write-Host writes to the Information stream (6), which a bare `>`
+# (stream 1) never captures - piping/redirecting this script's stdout
+# silently drops everything printed via Write-Host even though it still
+# shows up live on screen. Write-Error does get captured by `2>`, but
+# wraps every message in PowerShell's own multi-line ErrorRecord format
+# instead of the clean single-line text a native tool's stderr would
+# produce. These two write straight to the real OS-level stdout/stderr
+# streams instead - same raw-stream philosophy already used for the wire
+# protocol itself (Write-Line above), just via the convenience TextWriter
+# wrappers since these are plain human-readable lines, not binary
+# payloads.
+function Write-Out([string]$text) {
+	[Console]::Out.WriteLine($text)
+}
+function Write-Err([string]$text) {
+	[Console]::Error.WriteLine($text)
+}
+
 function Read-Line([System.IO.Stream]$stream) {
 	$bytes = New-Object System.Collections.Generic.List[byte]
 	while ($true) {
@@ -271,7 +316,7 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 		if (-not (Test-Path -LiteralPath $netcatExe -PathType Leaf)) {
 			$found = Get-Command "gs-netcat.exe" -ErrorAction SilentlyContinue
 			if ($null -eq $found) {
-				Write-Error "gs-netcat.exe not found. Check PATH=?"
+				Write-Err "gs-netcat.exe not found. Check PATH=?"
 				exit 1
 			}
 			$netcatExe = $found.Source
@@ -325,7 +370,7 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 	if (-not (Test-Path -LiteralPath $netcatExe -PathType Leaf)) {
 		$found = Get-Command "gs-netcat.exe" -ErrorAction SilentlyContinue
 		if ($null -eq $found) {
-			Write-Error "gs-netcat.exe not found. Check PATH=?"
+			Write-Err "gs-netcat.exe not found. Check PATH=?"
 			exit 1
 		}
 		$netcatExe = $found.Source
@@ -476,52 +521,168 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 	function Write-ListingLine([string]$type, [int64]$size, [int64]$mtime, [string]$name) {
 		$dateStr = Format-HumanDate $mtime
 		if ($type -eq "D") {
-			Write-Host ("{0,-10}  {1,-16}  {2}/" -f "-", $dateStr, "$name")
+			Write-Out ("{0,-10}  {1,-16}  {2}/" -f "-", $dateStr, "$name")
 		} else {
-			Write-Host ("{0,-10}  {1,-16}  {2}" -f (Format-HumanSize $size), $dateStr, "$name")
+			Write-Out ("{0,-10}  {1,-16}  {2}" -f (Format-HumanSize $size), $dateStr, "$name")
+		}
+	}
+
+	# -FullPath's "no columns, just the path" renderer - the point is a
+	# clean, one-path-per-line list that's safe to capture/redirect and
+	# reuse later, matching real bash `ls -1`'s own bare-name-per-line
+	# output (just using the full server-relative path instead of a bare
+	# name, since gs-transfer's glob/recursive listings can span multiple
+	# directories where a bare name alone would be ambiguous). Applies
+	# uniformly to every listing path - plain, glob, and recursive - not
+	# just the plain case.
+	function Write-PathOnlyLine([string]$type, [int64]$size, [int64]$mtime, [string]$name) {
+		Write-Out $name
+	}
+
+	# True if $path contains a glob metacharacter (* or ?) anywhere - the
+	# trigger for glob matching in ls/get. Accepted tradeoff, same one
+	# every shell glob already makes: a real remote filename literally
+	# containing * or ? can no longer be fetched by exact name.
+	function Test-IsGlob([string]$path) {
+		return $path.IndexOfAny([char[]]@('*', '?')) -ge 0
+	}
+
+	# Splits $pattern into .Prefix (literal segments before the first
+	# wildcard segment, "." if none) and .Suffix (that segment through
+	# the end) - see docs/gs-transfer-client-plan.md (kept local, not
+	# part of this repo) for the full design. Only ever called after
+	# Test-IsGlob confirms a wildcard exists somewhere.
+	function Split-GlobPattern([string]$pattern) {
+		$segs = $pattern.Split('/')
+		$i = 0
+		$prefixParts = @()
+		while ($i -lt $segs.Length) {
+			if ($segs[$i].IndexOfAny([char[]]@('*', '?')) -ge 0) { break }
+			$prefixParts += $segs[$i]
+			$i++
+		}
+		$prefix = if ($prefixParts.Length -eq 0) { "." } else { $prefixParts -join '/' }
+		$suffix = ($segs[$i..($segs.Length - 1)]) -join '/'
+		return [PSCustomObject]@{ Prefix = $prefix; Suffix = $suffix }
+	}
+
+	# Translates $suffix (see Split-GlobPattern) into a .NET regex,
+	# anchored at both ends: * -> [^/]*, ? -> [^/], **/ -> zero-or-more
+	# whole segments ((.*/)?) - makes **/*.txt match both readme.txt
+	# (root) and a/b/readme.txt (any depth) - bare ** (no following /)
+	# -> .*, everything else escaped via [regex]::Escape. Known, accepted
+	# asymmetry: a *trailing* bare ** with nothing after it (photos/**)
+	# falls through to the generic .* branch rather than getting the
+	# same "optional" treatment - not worth special-casing for a pattern
+	# shape nobody asked for.
+	function ConvertTo-GlobRegex([string]$suffix) {
+		$out = "^"
+		$i = 0
+		$n = $suffix.Length
+		while ($i -lt $n) {
+			$c = $suffix[$i]
+			if ($c -eq '*' -and ($i + 1) -lt $n -and $suffix[$i + 1] -eq '*') {
+				if (($i + 2) -lt $n -and $suffix[$i + 2] -eq '/') {
+					$out += "(.*/)?"
+					$i += 3
+				} else {
+					$out += ".*"
+					$i += 2
+				}
+			} elseif ($c -eq '*') {
+				$out += "[^/]*"
+				$i++
+			} elseif ($c -eq '?') {
+				$out += "[^/]"
+				$i++
+			} else {
+				$out += [regex]::Escape([string]$c)
+				$i++
+			}
+		}
+		return $out + '$'
+	}
+
+	# True if $suffix needs a full recursive walk (RECURSE) rather than
+	# a single-level LIST - either it spans multiple segments, or it
+	# contains "**" anywhere (a bare "**" is itself one segment but
+	# still needs the full walk, since it can match any depth).
+	function Test-GlobIsComplex([string]$suffix) {
+		return $suffix.Contains('/') -or $suffix.Contains('**')
+	}
+
+	# Shared by Invoke-RemoteWalk (RECURSE) and Invoke-PaginatedList
+	# (LIST): sends "<verb> <path> <pageSize> [<cursor>]" repeatedly,
+	# fully draining each page (through END/MORE) before invoking
+	# $Callback once per entry - the wire protocol is strictly
+	# request/response, and a callback that issues its own request (GET)
+	# must never race a still-in-flight page. $Callback receives (type,
+	# size, mtime, name) where name is whatever the responder returned
+	# verbatim - a bare basename for LIST, a full relpath for RECURSE;
+	# Invoke-RemoteWalk below is responsible for translating that into
+	# its own callback's richer signature.
+	function Invoke-PaginatedRequest([System.IO.Stream]$inStream, [System.IO.Stream]$outStream, [string]$verb, [string]$path, [int]$pageSize, [int]$timeoutSec, [scriptblock]$Callback) {
+		$cursor = $null
+		while ($true) {
+			if ($cursor) {
+				Write-Line $outStream "$verb $path $pageSize $cursor"
+			} else {
+				Write-Line $outStream "$verb $path $pageSize"
+			}
+			$entries = @()
+			$atEnd = $false
+			$moreCursor = $null
+			while ($true) {
+				$line = Read-LineTimeout $inStream $timeoutSec
+				if ($null -eq $line) { Write-Err "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
+				if ($line -eq "END") { $atEnd = $true; break }
+				if ($line.StartsWith("MORE ")) { $moreCursor = $line.Substring(5); break }
+				if ($line.StartsWith("ERR ")) { Write-Err "server: $($line.Substring(4)) ($path)"; exit 1 }
+				$parts = $line.Split(" ", 4)
+				$entries += [PSCustomObject]@{ Type = $parts[0]; Size = [int64]$parts[1]; Mtime = [int64]$parts[2]; Name = $parts[3] }
+			}
+			foreach ($e in $entries) {
+				& $Callback $e.Type $e.Size $e.Mtime $e.Name
+			}
+			if ($atEnd) { break }
+			$cursor = $moreCursor
 		}
 	}
 
 	# Recursively walks $remoteRoot (a directory on the responder) via
-	# repeated LIST calls - the wire protocol has no recursion of its own.
-	# Invokes $Callback once per entry found, as:
+	# RECURSE, paginated ($PageSize entries per page - the server does
+	# the actual recursion now, this just pages through a flat result
+	# stream via Invoke-PaginatedRequest above). Invokes $Callback once
+	# per entry found, as:
 	#   & $Callback <type> <size> <mtime> <relpath> <remoteRoot>
 	# where <relpath> is always relative to $remoteRoot and always /-
-	# separated. Fully drains each LIST's response (through END) before
-	# invoking any callback - the wire protocol is strictly
-	# request/response, and a callback that issues its own request (GET)
-	# must never collide with a still-in-flight LIST response.
+	# separated, regardless of the responder's own platform.
 	function Invoke-RemoteWalk([System.IO.Stream]$inStream, [System.IO.Stream]$outStream, [string]$remoteRoot, [int]$timeoutSec, [scriptblock]$Callback) {
-		$dirs = New-Object System.Collections.Generic.Queue[string]
-		$dirs.Enqueue("")
-		while ($dirs.Count -gt 0) {
-			$rel = $dirs.Dequeue()
-			if ([string]::IsNullOrEmpty($rel)) { $full = $remoteRoot } else { $full = Join-RemotePath $remoteRoot $rel }
-			Write-Line $outStream "LIST $full"
-			$entries = @()
-			while ($true) {
-				$line = Read-LineTimeout $inStream $timeoutSec
-				if ($null -eq $line) { Write-Error "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
-				if ($line -eq "END") { break }
-				if ($line.StartsWith("ERR ")) { Write-Error "server: $($line.Substring(4)) ($full)"; exit 1 }
-				$parts = $line.Split(" ", 4)
-				$relpath = if ([string]::IsNullOrEmpty($rel)) { $parts[3] } else { "$rel/$($parts[3])" }
-				$entries += [PSCustomObject]@{ Type = $parts[0]; Size = [int64]$parts[1]; Mtime = [int64]$parts[2]; RelPath = $relpath }
-			}
-			foreach ($e in $entries) {
-				& $Callback $e.Type $e.Size $e.Mtime $e.RelPath $remoteRoot
-				if ($e.Type -eq "D") { $dirs.Enqueue($e.RelPath) }
-			}
-		}
+		$inner = {
+			param($type, $size, $mtime, $relpath)
+			& $Callback $type $size $mtime $relpath $remoteRoot
+		}.GetNewClosure()
+		Invoke-PaginatedRequest $inStream $outStream "RECURSE" $remoteRoot $PageSize $timeoutSec $inner
+	}
+
+	# Paginated single-level LIST - one directory's immediate children
+	# only (name is already bare, no root/relpath to compute). Used by
+	# plain `ls` (no -Recursive, no glob) and the glob "simple case" (a
+	# pattern whose suffix can only ever match one level deep, where a
+	# full RECURSE would walk an irrelevant subtree for nothing).
+	# Invokes $Callback once per entry found, as:
+	#   & $Callback <type> <size> <mtime> <name>
+	function Invoke-PaginatedList([System.IO.Stream]$inStream, [System.IO.Stream]$outStream, [string]$dir, [int]$timeoutSec, [scriptblock]$Callback) {
+		Invoke-PaginatedRequest $inStream $outStream "LIST" $dir $PageSize $timeoutSec $Callback
 	}
 
 	function Send-RemoteMkdir([System.IO.Stream]$inStream, [System.IO.Stream]$outStream, [string]$path, [int]$timeoutSec) {
 		Write-Line $outStream "MKDIR $path"
 		$resp = Read-LineTimeout $inStream $timeoutSec
-		if ($null -eq $resp) { Write-Error "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
+		if ($null -eq $resp) { Write-Err "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
 		if ($resp -eq "OK") { return }
-		if ($resp.StartsWith("ERR ")) { Write-Error "server: $($resp.Substring(4)) (mkdir $path)"; exit 1 }
-		Write-Error "unexpected response: $resp"
+		if ($resp.StartsWith("ERR ")) { Write-Err "server: $($resp.Substring(4)) (mkdir $path)"; exit 1 }
+		Write-Err "unexpected response: $resp"
 		exit 1
 	}
 
@@ -548,7 +709,7 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 		}
 
 		$resp = Read-LineTimeout $inStream $timeoutSec
-		if ($null -eq $resp) { Write-Error "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
+		if ($null -eq $resp) { Write-Err "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
 
 		if ($resp.StartsWith("OK ")) {
 			$n = [int64]$resp.Substring(3)
@@ -557,37 +718,37 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 				try {
 					[void]$fs.Seek(0, [System.IO.SeekOrigin]::End)
 					if (-not (Copy-ExactBytesTimeout $inStream $fs $n $dataTimeoutSec)) {
-						Write-Error "timed out (${dataTimeoutSec}s) or lost connection while receiving data - partial kept for a later resume"
+						Write-Err "timed out (${dataTimeoutSec}s) or lost connection while receiving data - partial kept for a later resume"
 						exit 1
 					}
 				} finally { $fs.Close() }
 			} else {
 				$fs = New-ExclusiveFile $partial
-				if ($null -eq $fs) { Write-Error "staging path blocked: $partial already exists and isn't a plain file"; exit 1 }
+				if ($null -eq $fs) { Write-Err "staging path blocked: $partial already exists and isn't a plain file"; exit 1 }
 				try {
 					if (-not (Copy-ExactBytesTimeout $inStream $fs $n $dataTimeoutSec)) {
-						Write-Error "timed out (${dataTimeoutSec}s) or lost connection while receiving data - partial kept for a later resume"
+						Write-Err "timed out (${dataTimeoutSec}s) or lost connection while receiving data - partial kept for a later resume"
 						exit 1
 					}
 				} finally { $fs.Close() }
 			}
 			Move-Item -LiteralPath $partial -Destination $localPath -Force
 			if ($offset) {
-				Write-Host "got $remote -> $localPath ($(Format-HumanSize ($offset + $n)), resumed from $(Format-HumanSize $offset))"
+				Write-Out "got $remote -> $localPath ($(Format-HumanSize ($offset + $n)), resumed from $(Format-HumanSize $offset))"
 			} else {
-				Write-Host "got $remote -> $localPath ($(Format-HumanSize $n))"
+				Write-Out "got $remote -> $localPath ($(Format-HumanSize $n))"
 			}
 		} elseif ($resp.StartsWith("ERR ")) {
 			if ($offset) {
-				Write-Warning "resume rejected ($($resp.Substring(4))); discarding partial and retrying fresh"
+				Write-Err "resume rejected ($($resp.Substring(4))); discarding partial and retrying fresh"
 				Remove-Item -LiteralPath $partial -Force
 				Receive-File $inStream $outStream $remote $localPath $timeoutSec $dataTimeoutSec
 				return
 			}
-			Write-Error "server: $($resp.Substring(4))"
+			Write-Err "server: $($resp.Substring(4))"
 			exit 1
 		} else {
-			Write-Error "unexpected response: $resp"
+			Write-Err "unexpected response: $resp"
 			exit 1
 		}
 	}
@@ -603,7 +764,7 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 
 		$resumeOffset = $null
 		$resp = Read-LineTimeout $inStream $timeoutSec
-		if ($null -eq $resp) { Write-Error "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
+		if ($null -eq $resp) { Write-Err "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
 
 		if ($resp -eq "FRESH") {
 			# nothing to do
@@ -615,10 +776,10 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 				if ($localHash -eq $rparts[1]) { $resumeOffset = $offerOffsetNum }
 			}
 		} elseif ($resp.StartsWith("ERR ")) {
-			Write-Error "server: $($resp.Substring(4))"
+			Write-Err "server: $($resp.Substring(4))"
 			exit 1
 		} else {
-			Write-Error "unexpected response: $resp"
+			Write-Err "unexpected response: $resp"
 			exit 1
 		}
 
@@ -635,25 +796,25 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 			try {
 				[void]$fs.Seek($resumeOffset, [System.IO.SeekOrigin]::Begin)
 				if (-not (Send-ExactBytesTimeout $fs $outStream $remaining $dataTimeoutSec)) {
-					Write-Error "timed out (${dataTimeoutSec}s) or lost connection while sending data"
+					Write-Err "timed out (${dataTimeoutSec}s) or lost connection while sending data"
 					exit 1
 				}
 			} finally { $fs.Close() }
 		}
 
 		$resp = Read-LineTimeout $inStream $timeoutSec
-		if ($null -eq $resp) { Write-Error "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
+		if ($null -eq $resp) { Write-Err "timed out (${timeoutSec}s) or lost connection waiting for a response"; exit 1 }
 		if ($resp -eq "OK") {
 			if ($resumeOffset -gt 0) {
-				Write-Host "put $localPath -> $remote ($(Format-HumanSize $size), resumed from $(Format-HumanSize $resumeOffset))"
+				Write-Out "put $localPath -> $remote ($(Format-HumanSize $size), resumed from $(Format-HumanSize $resumeOffset))"
 			} else {
-				Write-Host "put $localPath -> $remote ($(Format-HumanSize $size))"
+				Write-Out "put $localPath -> $remote ($(Format-HumanSize $size))"
 			}
 		} elseif ($resp.StartsWith("ERR ")) {
-			Write-Error "server: $($resp.Substring(4))"
+			Write-Err "server: $($resp.Substring(4))"
 			exit 1
 		} else {
-			Write-Error "unexpected response: $resp"
+			Write-Err "unexpected response: $resp"
 			exit 1
 		}
 	}
@@ -697,31 +858,75 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 		switch ($Command) {
 			"ls" {
 				$path = if ($Arg1) { $Arg1 } else { "" }
-				if ($Recursive) {
+				if (Test-IsGlob $path) {
+					$split = Split-GlobPattern $path
+					$regex = ConvertTo-GlobRegex $split.Suffix
+					if (Test-GlobIsComplex $split.Suffix) {
+						$callback = {
+							param($type, $size, $mtime, $relpath, $root)
+							if ($relpath -notmatch $regex) { return }
+							$full = Join-RemotePath $root $relpath
+							if ($FullPath) { Write-PathOnlyLine $type $size $mtime $full } else { Write-ListingLine $type $size $mtime $full }
+						}.GetNewClosure()
+						Invoke-RemoteWalk $clientIn $clientOut $split.Prefix $Timeout $callback
+					} else {
+						$callback = {
+							param($type, $size, $mtime, $name)
+							if ($name -notmatch $regex) { return }
+							$full = Join-RemotePath $split.Prefix $name
+							if ($FullPath) { Write-PathOnlyLine $type $size $mtime $full } else { Write-ListingLine $type $size $mtime $full }
+						}.GetNewClosure()
+						Invoke-PaginatedList $clientIn $clientOut $split.Prefix $Timeout $callback
+					}
+				} elseif ($Recursive) {
 					$pathClean = $path.TrimEnd('/')
 					if ([string]::IsNullOrEmpty($pathClean)) { $pathClean = "." }
 					$callback = {
 						param($type, $size, $mtime, $relpath, $root)
-						Write-ListingLine $type $size $mtime (Join-RemotePath $root $relpath)
+						$full = Join-RemotePath $root $relpath
+						if ($FullPath) { Write-PathOnlyLine $type $size $mtime $full } else { Write-ListingLine $type $size $mtime $full }
 					}.GetNewClosure()
 					Invoke-RemoteWalk $clientIn $clientOut $pathClean $Timeout $callback
 				} else {
-					Write-Line $clientOut "LIST $path"
-					while ($true) {
-						$line = Read-LineTimeout $clientIn $Timeout
-						if ($null -eq $line) { Write-Error "timed out (${Timeout}s) or lost connection waiting for a response"; exit 1 }
-						if ($line -eq "END") { break }
-						if ($line.StartsWith("ERR ")) { Write-Error "server: $($line.Substring(4))"; exit 1 }
-						$parts = $line.Split(" ", 4)
-						Write-ListingLine $parts[0] ([int64]$parts[1]) ([int64]$parts[2]) $parts[3]
-					}
+					$callback = {
+						param($type, $size, $mtime, $name)
+						if ($FullPath) {
+							Write-PathOnlyLine $type $size $mtime (Join-RemotePath $path $name)
+						} else {
+							Write-ListingLine $type $size $mtime $name
+						}
+					}.GetNewClosure()
+					Invoke-PaginatedList $clientIn $clientOut $path $Timeout $callback
 				}
 			}
 			"get" {
 				$remoteRaw = $Arg1
 				$destRoot = $Arg2
-				if ([string]::IsNullOrEmpty($remoteRaw)) { Write-Error "get requires a remote path"; exit 1 }
-				if ($Recursive) {
+				if ([string]::IsNullOrEmpty($remoteRaw)) { Write-Err "get requires a remote path"; exit 1 }
+				if (Test-IsGlob $remoteRaw) {
+					$split = Split-GlobPattern $remoteRaw
+					$regex = ConvertTo-GlobRegex $split.Suffix
+					$globDestRoot = if ($destRoot) { $destRoot } else { "." }
+					if (Test-GlobIsComplex $split.Suffix) {
+						$callback = {
+							param($type, $size, $mtime, $relpath, $root)
+							if ($relpath -notmatch $regex) { return }
+							if ($type -ne "F") { return }
+							$fullRemote = Join-RemotePath $root $relpath
+							Receive-File $clientIn $clientOut $fullRemote (Join-Path $globDestRoot ($fullRemote -replace '/', '\')) $Timeout $DataTimeout
+						}.GetNewClosure()
+						Invoke-RemoteWalk $clientIn $clientOut $split.Prefix $Timeout $callback
+					} else {
+						$callback = {
+							param($type, $size, $mtime, $name)
+							if ($name -notmatch $regex) { return }
+							if ($type -ne "F") { return }
+							$fullRemote = Join-RemotePath $split.Prefix $name
+							Receive-File $clientIn $clientOut $fullRemote (Join-Path $globDestRoot ($fullRemote -replace '/', '\')) $Timeout $DataTimeout
+						}.GetNewClosure()
+						Invoke-PaginatedList $clientIn $clientOut $split.Prefix $Timeout $callback
+					}
+				} elseif ($Recursive) {
 					$localDest = Get-EffectiveDest $remoteRaw $destRoot
 					$remoteClean = $remoteRaw.TrimEnd('/')
 					if ([string]::IsNullOrEmpty($remoteClean)) { $remoteClean = "." }
@@ -734,13 +939,13 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 			"put" {
 				$localRaw = $Arg1
 				$destRoot = $Arg2
-				if ([string]::IsNullOrEmpty($localRaw)) { Write-Error "put requires a local path"; exit 1 }
-				if (-not (Test-Path -LiteralPath $localRaw)) { Write-Error "no such file or directory: $localRaw"; exit 1 }
+				if ([string]::IsNullOrEmpty($localRaw)) { Write-Err "put requires a local path"; exit 1 }
+				if (-not (Test-Path -LiteralPath $localRaw)) { Write-Err "no such file or directory: $localRaw"; exit 1 }
 				if ($Recursive -and (Test-Path -LiteralPath $localRaw -PathType Container)) {
 					$remoteDest = Get-EffectiveDest $localRaw $destRoot -RemoteOutput
 					Send-DirectoryRecursive $clientIn $clientOut $localRaw $remoteDest $Timeout $DataTimeout
 				} else {
-					if (-not (Test-Path -LiteralPath $localRaw -PathType Leaf)) { Write-Error "not a regular file: $localRaw"; exit 1 }
+					if (-not (Test-Path -LiteralPath $localRaw -PathType Leaf)) { Write-Err "not a regular file: $localRaw"; exit 1 }
 					$remote = if ($destRoot) { $destRoot } else { Split-Path -Leaf $localRaw }
 					Send-File $clientIn $clientOut $localRaw $remote $Timeout $DataTimeout
 				}
@@ -748,14 +953,14 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 			"pwd" {
 				Write-Line $clientOut "PWD"
 				$resp = Read-LineTimeout $clientIn $Timeout
-				if ($null -eq $resp) { Write-Error "timed out (${Timeout}s) or lost connection waiting for a response"; exit 1 }
+				if ($null -eq $resp) { Write-Err "timed out (${Timeout}s) or lost connection waiting for a response"; exit 1 }
 				if ($resp.StartsWith("OK ")) {
-					Write-Host $resp.Substring(3)
+					Write-Out $resp.Substring(3)
 				} elseif ($resp.StartsWith("ERR ")) {
-					Write-Error "server: $($resp.Substring(4))"
+					Write-Err "server: $($resp.Substring(4))"
 					exit 1
 				} else {
-					Write-Error "unexpected response: $resp"
+					Write-Err "unexpected response: $resp"
 					exit 1
 				}
 			}
@@ -764,9 +969,45 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 				# creates the whole tree unconditionally (see its own
 				# comment), so every mkdir here does too.
 				$remotePath = $Arg1
-				if ([string]::IsNullOrEmpty($remotePath)) { Write-Error "mkdir requires a remote path"; exit 1 }
+				if ([string]::IsNullOrEmpty($remotePath)) { Write-Err "mkdir requires a remote path"; exit 1 }
 				Send-RemoteMkdir $clientIn $clientOut $remotePath $Timeout
-				Write-Host "mkdir $remotePath"
+				Write-Out "mkdir $remotePath"
+			}
+			"stat" {
+				$remotePath = if ($Arg1) { $Arg1 } else { "." }
+				Write-Line $clientOut "STAT $remotePath"
+				$resp = Read-LineTimeout $clientIn $Timeout
+				if ($null -eq $resp) { Write-Err "timed out (${Timeout}s) or lost connection waiting for a response"; exit 1 }
+				if ($resp.StartsWith("OK ")) {
+					# OK <type> <size> <mtime> <atime> <birthtime> <file_count> <dir_count>
+					$fields = $resp.Substring(3).Split(" ")
+					$stType = $fields[0]; $stSize = [int64]$fields[1]; $stMtime = [int64]$fields[2]
+					$stAtime = [int64]$fields[3]; $stBtime = [int64]$fields[4]
+					$stFiles = $fields[5]; $stDirs = $fields[6]
+					if ($stType -eq "D") {
+						Write-Out "type:       directory"
+					} else {
+						Write-Out "type:       file"
+						Write-Out "size:       $stSize ($(Format-HumanSize $stSize))"
+					}
+					Write-Out "mtime:      $(Format-HumanDate $stMtime)"
+					Write-Out "atime:      $(Format-HumanDate $stAtime)"
+					if ($stBtime -eq 0) {
+						Write-Out "birthtime:  unknown"
+					} else {
+						Write-Out "birthtime:  $(Format-HumanDate $stBtime)"
+					}
+					if ($stType -eq "D") {
+						Write-Out "files:      $stFiles"
+						Write-Out "dirs:       $stDirs"
+					}
+				} elseif ($resp.StartsWith("ERR ")) {
+					Write-Err "server: $($resp.Substring(4))"
+					exit 1
+				} else {
+					Write-Err "unexpected response: $resp"
+					exit 1
+				}
 			}
 			default {
 				Show-Usage
@@ -871,6 +1112,16 @@ function Do-List([string]$dir, [Nullable[int]]$maxcount, [string]$cursor) {
 	if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
 	if ($dir -ne ".") {
 		if (-not (Test-SafePath $dir)) { Write-Line $stdout "ERR invalid path"; return }
+		if (Test-Path -LiteralPath $dir -PathType Leaf) {
+			# A single file, not a directory - matches real `ls <file>`:
+			# list just that one entry instead of erroring. Re-split into
+			# parent/leaf so Send-PaginatedListing's own Join-Path-based
+			# lookup resolves it exactly like any other entry.
+			$parent = Split-Path -Path $dir -Parent
+			if ([string]::IsNullOrEmpty($parent)) { $parent = "." }
+			Send-PaginatedListing $parent $maxcount $cursor @((Split-Path -Path $dir -Leaf))
+			return
+		}
 		if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Write-Line $stdout "ERR not found"; return }
 	}
 	# Dot-prefixed names are excluded - Windows has no equivalent "hidden

@@ -60,37 +60,37 @@ split into two files, so there's nothing extra to deploy:
    this time with stdin/stdout wired to the tunnel - this half is
    completely unchanged from before standalone launching existed, and
    has no idea whether it was reached via the launcher above or a
-   manually-typed `gs-netcat -l -e /path/to/this/script` (still fully
-   supported, unchanged).
+   manually-typed `gs-netcat -l -e /path/to/this/script`.
 
 ### Telling the two apart
-
-Neither a command-line flag nor an environment variable can do this
-alone, because the manual invocation path above - which has to keep
-working exactly as it always has - never sets anything special at all:
-`gs-netcat`'s `-e` passes no arguments of its own, and nothing in that
-flow ever touches the environment either. So each script uses two
-signals together, worker if *either* fires:
 
 - **An explicit marker** (`GSTRANSFER_WORKER=1` / `$env:GSTRANSFER_WORKER`)
   the launcher sets on itself just before becoming `gs-netcat` - inherited
   through `gs-netcat`'s own child-process creation for its `-e` command,
   so by the time *that* process starts, the marker is already there.
-- **Whether stdin looks like a pipe** - `gs-netcat` wires a `-e` child's
-  stdin to a pipe (confirmed directly against this project's own
-  `win_childproc.c`: `CreatePipe`, not a console or file handle), which a
-  fresh launch from an interactive shell, or a backgrounded/redirected one
-  with no explicit stdin redirect, never is. This is deliberately a
-  precise pipe-or-not check (bash's own `-p` test; on Windows, the raw
-  Win32 `GetFileType`, checked for exactly `FILE_TYPE_PIPE` i.e. `3`) -
-  not .NET's `Console.IsInputRedirected`, which was tried first and
-  rejected: it's also true for a plain `/dev/null` redirect (a
-  backgrounded launch with no console attached, not a `-e` child at all),
-  which would have been misread as a worker.
 
-The explicit marker alone covers the standalone-launch path; the pipe
-check is what keeps the pre-existing manual path working without ever
-needing to know this launcher logic exists at all.
+**POSIX**: the marker is the *only* signal - `GSTRANSFER_WORKER=1` must be
+set for worker mode to trigger. This used to be OR'd with a second,
+fallback signal ("does stdin look like a pipe?", via bash's `-p` test) to
+keep a manually-typed `gs-netcat -l -e /path/to/this/script` (no launcher,
+no marker) working. Dropped: a pipe-type stdin isn't unique to `gs-netcat`'s
+`-e` - e.g. `parallel -j1 --ungroup gs-transfer.sh -s secret ls {} ::: ...`
+tripped it for an ordinary client invocation, which then read immediate
+EOF and exited instead of running the client. The manual invocation style
+now needs the marker set explicitly too:
+`GSTRANSFER_WORKER=1 gs-netcat -s <secret> -l -e /path/to/gs-transfer.sh`.
+
+**Windows**: still uses the marker OR a fallback pipe check, unchanged -
+`gs-netcat.exe` wires a `-e` child's stdin to a pipe (confirmed directly
+against this project's own `win_childproc.c`: `CreatePipe`, not a console
+or file handle). This is deliberately a precise pipe-or-not check (the raw
+Win32 `GetFileType`, checked for exactly `FILE_TYPE_PIPE` i.e. `3`) - not
+.NET's `Console.IsInputRedirected`, which was tried first and rejected:
+it's also true for a plain `/dev/null` redirect, which would have been
+misread as a worker. It also requires *no console window*
+(`GetConsoleWindow() == NULL`) at the same time, specifically to avoid
+misreading an interactive ConPTY session (which also has pipe-backed
+stdio under the hood) as a worker.
 
 ### Windows: a bare script path doesn't work as `-e`'s value
 
@@ -135,11 +135,14 @@ HASH <path>
 QUIT
 ```
 `LIST` with no argument lists the responder's current working directory;
-`LIST <path>` lists a subdirectory relative to it. `RECURSE <path>` walks
+`LIST <path>` lists a subdirectory relative to it. If `<path>` names a
+plain file rather than a directory, `LIST` returns a listing of exactly
+that one entry (matching real `ls <file>`) instead of an error.
+`RECURSE <path>` walks
 the whole subtree under `<path>` instead of just its immediate children -
 see **Pagination (LIST, RECURSE)** below for `<maxcount>`/`<cursor>` on
-both verbs, and **Scope / accepted limitations** for why `-r` (the
-client's own recursion flag) doesn't use `RECURSE` yet. `<path>` in
+both verbs, and **Recursion (`-r`)**/**Globbing** below for how the
+client actually uses it. `<path>` in
 `GET`/`PUT`/`MKDIR`/`RECURSE`/`STAT`/`HASH` may include `/`-separated
 subdirectories (e.g. `logs/2026-11-01.txt`) - see **Path rules** below for
 exactly what's allowed. `GET`'s optional `<offset> <hash>` is a resume
@@ -228,6 +231,11 @@ Windows/.NET equivalent to expose); permissions/ownership (this
 protocol's trust model has no partial-access concept); a "does a
 `.partial` already exist" pre-check (already free via `PUT`'s own
 `FRESH`/`RESUME` handshake).
+
+The client exposes this directly as `stat [path]` - one request, no
+`LIST`/`RECURSE` pagination involved, printing the fields above in a
+human-readable form (sizes/dates formatted the same way `ls` already
+does, `birthtime: unknown` for the `0`-means-unknown case).
 
 ### `HASH`
 
@@ -511,15 +519,21 @@ bounded-overlap reasoning above.
 
 ## Recursion (`-r`)
 
-The wire protocol has no recursion primitive of its own - `gs-transfer-
-client.sh -r` builds it entirely client-side out of repeated `LIST`
-calls (to walk a remote directory tree) plus one `GET`/`PUT`/`MKDIR` per
-entry found. Responders need nothing beyond the `MKDIR` verb above; they
-have no notion of "recursive" requests at all.
+`ls -r`/`get -r` walk a remote directory tree via one paginated `RECURSE`
+call (see **Pagination (LIST, RECURSE)** above) instead of a client-side
+BFS over repeated `LIST` calls - the server does the actual recursion;
+the client just pages through the flat result stream `RECURSE` returns
+and creates directories (`MKDIR`)/fetches files (`GET`) to match. `put -r`
+is unaffected - it walks the *local* filesystem (no wire calls for that
+part at all), so there's nothing for `RECURSE` to do there. Responders
+need nothing beyond `RECURSE`/`MKDIR`; they have no notion of a
+"recursive request" as such - a client driving the old repeated-`LIST`
+approach by hand would still work identically, `RECURSE` is just what
+this client actually uses now.
 
 - `ls -r [path]`: walks `path` (the responder's own directory if
-  omitted) via repeated `LIST`, printing every file and subdirectory
-  found, with paths shown relative to `path`.
+  omitted), printing every file and subdirectory found, with paths shown
+  relative to `path`.
 - `get -r <remote> [local]` / `put -r <local> [remote]`: replicates a
   whole directory tree across the tunnel, creating directories (via
   `MKDIR`) and files (via `PUT`/`GET`) to match. If the source argument
@@ -529,6 +543,15 @@ have no notion of "recursive" requests at all.
   non-recursive commands use, so **Resume and partial-file safety**
   above applies per-file here too - an interrupted recursive transfer
   resumes the one file it was on, not the whole tree from scratch.
+
+On the POSIX client, `-r`/`-1` are parsed after the subcommand name
+(`ls -r`, not `-r ls`) via that subcommand's own `getopts` pass, so a
+literal `--` there (e.g. `ls -- -oddly-named-file`) forces everything
+after it to be read as a positional path argument rather than an
+option - the usual way to reach a remote file whose name itself starts
+with `-`. PowerShell's client has no equivalent sentinel (its parameter
+binder doesn't enforce flag-before-positional ordering in the first
+place, but also has nothing for a `-`-prefixed path either).
 
 ### Trailing-slash destination rule (matches `rsync -r`)
 
@@ -554,19 +577,72 @@ sent as part of a `path` (it would fail **Path rules**' "no trailing /"
 check anyway); the client strips it locally and uses it only to decide
 the destination layout.
 
+## Globbing
+
+`ls`/`get` accept `*`, `?`, and `**` in the path argument - auto-detected
+(any `*`/`?` anywhere means "treat as a pattern"), no separate flag.
+Still purely client-side, same as `-r` - the responder has no concept of
+a pattern at all, it only ever sees plain `LIST`/`RECURSE` requests for a
+literal path the client already resolved.
+
+**Splitting a pattern into prefix + suffix**: split on `/`; the first
+segment containing `*`/`?` is where the literal part ends - everything
+before it is the `prefix` (`.` if the very first segment has a
+wildcard), that segment through the end is the `suffix`. No wildcard
+anywhere in the whole pattern -> not a glob, exact-path behavior
+unchanged.
+
+**Simple case** (suffix is one segment, no `**`): one paginated `LIST
+<prefix>`, matching each entry's bare name - `ls photos/*.jpg` never
+walks anything beneath `photos`, since a single-segment pattern
+structurally can't match anything deeper.
+
+**Complex case** (suffix spans multiple segments, with or without
+`**`): one paginated `RECURSE <prefix>`, matching the *whole* suffix
+against each entry's relpath - `**/*.txt` matches a file at any depth
+(including the root), `logs/202*/file.txt` matches exactly two levels
+below `logs`.
+
+**Glob-to-regex translation** (identical in both `gs-transfer.sh` and
+`gs-transfer.ps1`): one left-to-right scan over the suffix, anchored at
+both ends - `*` -> `[^/]*`, `?` -> `[^/]`, a `**` immediately followed by
+`/` -> `(.*/)?` (zero-or-more whole segments, including the slash - the
+part that makes `**/*.txt` match both a root-level file and a nested
+one), a bare `**` with nothing after it -> `.*`, everything else escaped
+as a literal. Known, accepted asymmetry: a *trailing* bare `**`
+(`photos/**`) falls through to the generic `.*` branch rather than
+getting the same "optional" treatment as the leading case - not worth
+special-casing for a pattern shape nobody's asked for.
+
+**Display and destination**: `ls` on a glob match always prints the full
+path relative to the responder's root, never a bare basename, since
+matches can come from different directories - same shape `-r`'s own
+listing already prints. `get` on a glob downloads every matched
+**file** (matched directories are skipped - no implicit recursion into
+them beyond what the pattern itself already expresses via `**`) to the
+complete matched remote path, recreated under the destination root
+(default `.`) - reuses the same single-file `GET` implementation (and
+therefore the same per-file resume) `-r` already uses. `-r`/`-Recursive`
+is simply ignored once a pattern is detected, not an error - the pattern
+itself already says how deep to go.
+
+`put` has no glob support, deliberately: the local side is already
+expanded by the calling shell before `gs-transfer` ever sees an
+argument (natively in bash; a PowerShell caller can pipe `Get-ChildItem`
+results in), so a remote-side pattern-matching engine would have
+nothing to do there.
+
 ## Scope / accepted limitations
 
 Deliberately minimal, matching this tool's "very minimalistic" brief:
 
 - Filenames must not contain newlines (undefined behavior if they do -
   not escaped/validated beyond that).
-- `RECURSE` (see **Wire format** above) does walk server-side, but `-r`
-  (see **Recursion** above) doesn't use it yet - it's still built
-  entirely client-side out of repeated `LIST` calls, unchanged by
-  `RECURSE`'s addition. Switching `-r` over is planned (see
-  `docs/gs-transfer-backend-plan.md`, kept local, not part of this repo),
-  not done. No server-side glob expansion - a client can glob locally
-  (shell globbing) and issue one `PUT`/`GET` per matched file.
+- No server-side glob expansion - the responder only ever sees plain
+  `LIST`/`RECURSE`/`GET`/`PUT` requests for a literal path; pattern
+  matching happens entirely client-side (see **Globbing** above). `put`
+  gets no glob support at all - the local side is already expanded by
+  the calling shell before `gs-transfer` ever sees an argument.
 - Resume (see **Resume and partial-file safety** above) only ever
   validates the already-transferred overlap, never the whole finished
   file, and only ever resumes a byte-for-byte contiguous prefix - there's

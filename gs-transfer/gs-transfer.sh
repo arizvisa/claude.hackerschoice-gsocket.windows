@@ -12,20 +12,33 @@
 #       no gs-netcat command line to construct by hand. Can also still be
 #       driven manually, exactly as before this script could launch
 #       gs-netcat on its own:
-#         gs-netcat -s <secret> -l -e /path/to/gs-transfer.sh
+#         GSTRANSFER_WORKER=1 gs-netcat -s <secret> -l -e /path/to/gs-transfer.sh
 #       (see the GSTRANSFER_WORKER check below - that path never sets -l,
-#       it re-execs this same script with no args at all).
+#       it re-execs this same script with no args at all, so
+#       GSTRANSFER_WORKER=1 has to be set explicitly to tell it to run as
+#       a worker instead of a client).
 #
-#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] ls [path]
-#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] get <remote-path> [local-path]
-#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] put <local-path> [remote-path]
+#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] ls [-r] [-1] [--] [path]
+#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] get [-r] [--] <remote-path> [local-path]
+#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] put [-r] [--] <local-path> [remote-path]
 #   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] pwd
 #   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] mkdir <remote-path>
+#   gs-transfer.sh [-s <secret>|-k <file>] [-T] [-t <timeout>] stat [path]
 #       Client mode (default, no -l). pwd reports the responder's own
 #       starting directory - what "." means on the wire. mkdir always
 #       creates the whole tree (mkdir -p semantics) - the responder's
 #       MKDIR already works that way unconditionally (see do_mkdir's own
-#       comment), so there's no flag needed to ask for it.
+#       comment), so there's no flag needed to ask for it. stat prints
+#       type/size/mtime/atime/birthtime, plus immediate file/dir counts
+#       for a directory - a single STAT request, no LIST/RECURSE
+#       pagination involved.
+#
+#       -r/-1 are subcommand-local flags, parsed after the subcommand
+#       name (not before, like -s/-k/-T/-t above) - ls/get/put each run
+#       their own getopts pass on their own argv. A literal "--" there
+#       forces everything after it to be read as a positional argument,
+#       never a flag - e.g. `ls -- -oddly-named-file` for a remote file
+#       that actually starts with a dash.
 #
 # get/put take independent local and remote paths (sftp/scp-style) - the
 # local path is whatever this machine's file is actually at (any valid
@@ -159,12 +172,23 @@ prefix_hash() {
 # Worker mode - gs-netcat's own -e exec'd this same script fresh, with
 # stdin/stdout now wired to the tunnel. Checked first, unconditionally,
 # before any argv parsing: gs-netcat's -e passes no arguments at all, so
-# this has to be detected from the environment/stdin, not from -l. The two
-# signals below (either is enough, see the server-mode header comment for
-# the full rationale) also keep the old manual-launch style working:
+# this has to be detected from the environment, not from -l - the -l
+# launcher branch below sets GSTRANSFER_WORKER=1 itself right before
+# exec'ing gs-netcat, so it's inherited by every worker -e spawns.
+#
+# This used to also accept "stdin is a pipe" ([[ -p /dev/stdin ]]) as a
+# second, fallback signal, to keep the old manual-launch style working
+# without requiring the env var:
 #   gs-netcat -s <secret> -l -e /path/to/gs-transfer.sh
+# Dropped: a pipe-type (or pipe-like) stdin is not unique to gs-netcat's
+# -e - e.g. `parallel -j1 --ungroup gs-transfer.sh -s secret ls {} ::: ...`
+# triggered this for an ordinary client invocation, which then read EOF
+# immediately and exited instead of running the client at all. The
+# manual-launch style above now needs GSTRANSFER_WORKER=1 set explicitly
+# (see the server-mode header comment above) - the single unambiguous
+# signal, not a heuristic that happens to also match other tools.
 # ============================================================================
-if [[ "${GSTRANSFER_WORKER:-}" == "1" ]] || [[ -p /dev/stdin ]]; then
+if [[ "${GSTRANSFER_WORKER:-}" == "1" ]]; then
 	log() { printf '%s\n' "$*" >&2; }
 
 	# Keeps every path confined to the responder's starting directory - see
@@ -273,6 +297,14 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]] || [[ -p /dev/stdin ]]; then
 		if [ "$dir" != "." ]; then
 			if ! is_safe_path "$dir"; then
 				printf 'ERR invalid path\n'
+				return
+			fi
+			if [ -f "$dir" ]; then
+				# A single file, not a directory - matches real `ls
+				# <file>`: list just that one entry instead of erroring,
+				# reusing the exact same emission emit_paginated_listing
+				# already does for a directory's own contents.
+				emit_paginated_listing "$(dirname -- "$dir")" "$maxcount" "$cursor" < <(basename -- "$dir")
 				return
 			fi
 			if [ ! -d "$dir" ]; then
@@ -588,7 +620,7 @@ command -v "${GS_NETCAT_BIN}" >/dev/null 2>&1 || { echo >&2 "${GS_NETCAT_BIN} no
 
 usage() {
 	echo >&2 "Usage: $0 -l [-s <secret>|-k <file>] [-T]"
-	echo >&2 "       $0 [-s <secret>|-k <file>] [-T] [-t <timeout>] [-r] ls [path] | get <remote-path> [local-path] | put <local-path> [remote-path] | pwd | mkdir <remote-path>"
+	echo >&2 "       $0 [-s <secret>|-k <file>] [-T] [-t <timeout>] ls [-r] [-1] [--] [path] | get [-r] [--] <remote-path> [local-path] | put [-r] [--] <local-path> [remote-path] | pwd | mkdir <remote-path> | stat [path]"
 	exit 1
 }
 
@@ -597,15 +629,13 @@ SECRET=""
 SECFILE=""
 USE_TOR=0
 TIMEOUT=30
-RECURSIVE=0
-while getopts ":ls:k:Tt:r" opt; do
+while getopts ":ls:k:Tt:" opt; do
 	case "$opt" in
 		l) LISTEN=1 ;;
 		s) SECRET="$OPTARG" ;;
 		k) SECFILE="$OPTARG" ;;
 		T) USE_TOR=1 ;;
 		t) TIMEOUT="$OPTARG" ;;
-		r) RECURSIVE=1 ;;
 		*) usage ;;
 	esac
 done
@@ -644,8 +674,37 @@ fi
 
 # --- Client mode (default, no -l) ---
 
+# Not exposed as a flag, same reasoning as DATA_TIMEOUT above: rarely the
+# right thing to tune per-invocation. Used as <maxcount> for every
+# LIST/RECURSE call this client makes - large enough that a typical
+# directory completes in one round trip, small enough to bound
+# worst-case response size for a pathological one.
+PAGE_SIZE=1000
+
 cmd="${1:-}"
 [[ -n "$cmd" ]] || usage
+cmd="${cmd,,}"
+shift
+
+# -r/-1 are subcommand-local flags (ls/get/put for -r, ls only for -1) -
+# parsed one level down from the global getopts above, now that $@ is
+# just this subcommand's own argv. OPTIND must be reset to 1 first -
+# getopts doesn't do that automatically between calls, and without it
+# this would resume from the global loop's stale index instead of
+# starting over on the new $@. A bare "--" here is handled by getopts
+# itself for free, same as above - it stops option parsing, so a
+# dash-prefixed path (e.g. "-foo") can still be passed as "-- -foo".
+RECURSIVE=0
+SHOW_FULL_PATH=0
+OPTIND=1
+while getopts ":r1" opt; do
+	case "$opt" in
+		r) RECURSIVE=1 ;;
+		1) SHOW_FULL_PATH=1 ;;
+		*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
 
 GSNC_ARGS=()
 [[ -n "$SECRET" ]] && GSNC_ARGS+=(-s "$SECRET")
@@ -738,57 +797,282 @@ print_listing_line() {
 	fi
 }
 
+# -1's "no columns, just the path" renderer - the point is a clean,
+# one-path-per-line list that's safe to capture/redirect and reuse
+# later, matching real bash `ls -1`'s own bare-name-per-line output
+# (just using the full server-relative path instead of a bare name,
+# since gs-transfer's glob/recursive listings can span multiple
+# directories where a bare name alone would be ambiguous). Applies
+# uniformly to every listing path - plain, glob, and recursive - not
+# just the plain case; see each callback below.
+print_path_only_line() {
+	printf '%s\n' "$4"
+}
+
 print_recursive_listing_line() {
 	local type="$1" size="$2" mtime="$3" relpath="$4" root="$5"
-	print_listing_line "$type" "$size" "$mtime" "$(join_path "$root" "$relpath")"
+	local full
+	full=$(join_path "$root" "$relpath")
+	if [[ "$SHOW_FULL_PATH" == "1" ]]; then
+		print_path_only_line "$type" "$size" "$mtime" "$full"
+	else
+		print_listing_line "$type" "$size" "$mtime" "$full"
+	fi
+}
+
+# True if $1 contains a glob metacharacter (* or ?) anywhere - the
+# trigger for glob matching in ls/get. Accepted tradeoff, same one every
+# shell glob already makes: a real remote filename literally containing
+# * or ? can no longer be fetched by exact name.
+is_glob() {
+	case "$1" in
+		*[*?]*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Splits $1 (a glob pattern) into GLOB_PREFIX (literal segments before
+# the first wildcard segment, "." if none) and GLOB_SUFFIX (that segment
+# through the end) - see docs/gs-transfer-client-plan.md (kept local,
+# not part of this repo) for the full design. Plain globals, not a
+# return value - same "simplest way to hand extra context" idiom this
+# file already uses for LOCAL_DEST.
+GLOB_PREFIX=""
+GLOB_SUFFIX=""
+glob_split() {
+	local pattern="$1"
+	local -a segs
+	local IFS='/'
+	read -ra segs <<< "$pattern"
+	local i=0
+	local -a prefix_parts=()
+	while [[ $i -lt ${#segs[@]} ]]; do
+		case "${segs[$i]}" in
+			*[*?]*) break ;;
+		esac
+		prefix_parts+=("${segs[$i]}")
+		i=$((i + 1))
+	done
+	if [[ ${#prefix_parts[@]} -eq 0 ]]; then
+		GLOB_PREFIX="."
+	else
+		GLOB_PREFIX="${prefix_parts[*]}"
+	fi
+	GLOB_SUFFIX="${segs[*]:$i}"
+}
+
+# Translates $1 (a glob suffix - see glob_split) into a POSIX ERE,
+# anchored at both ends: * -> [^/]*, ? -> [^/], **/ -> zero-or-more
+# whole segments ((.*/)?) - makes **/*.txt match both readme.txt (root)
+# and a/b/readme.txt (any depth) - bare ** (no following /) -> .*,
+# everything else escaped as a literal. Known, accepted asymmetry: a
+# *trailing* bare ** with nothing after it (photos/**) falls through to
+# the generic .* branch rather than getting the same "optional"
+# treatment, so it requires an actual / plus something after photos -
+# not worth special-casing for a pattern shape nobody asked for.
+glob_to_regex() {
+	local pattern="$1"
+	local out="^" i=0 n=${#pattern} c
+	while ((i < n)); do
+		c="${pattern:i:1}"
+		if [[ "$c" == "*" && "${pattern:i:2}" == "**" ]]; then
+			if [[ "${pattern:i+2:1}" == "/" ]]; then
+				out+="(.*/)?"
+				i=$((i + 3))
+			else
+				out+=".*"
+				i=$((i + 2))
+			fi
+		elif [[ "$c" == "*" ]]; then
+			out+="[^/]*"
+			i=$((i + 1))
+		elif [[ "$c" == "?" ]]; then
+			out+="[^/]"
+			i=$((i + 1))
+		else
+			case "$c" in
+				'.' | '[' | ']' | '(' | ')' | '{' | '}' | '+' | '^' | '$' | '|' | '\') out+="\\$c" ;;
+				*) out+="$c" ;;
+			esac
+			i=$((i + 1))
+		fi
+	done
+	printf '%s$\n' "$out"
+}
+
+# True if $1 (a glob suffix) needs a full recursive walk (RECURSE)
+# rather than a single-level LIST - either it spans multiple segments,
+# or it contains "**" anywhere (a bare "**" is itself one segment but
+# still needs the full walk, since it can match any depth).
+glob_is_complex() {
+	case "$1" in
+		*/* | *'**'*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Context for the glob callbacks below - set once by ls)/get) just
+# before calling remote_walk/list_paginated, same dynamic-scoping idiom
+# as LOCAL_DEST/get_one.
+GLOB_REGEX=""
+GLOB_DEST_ROOT=""
+
+# Callback for list_paginated (glob "simple case" - suffix is one
+# segment, no **): matches a bare name against $GLOB_REGEX, prints
+# path-qualified (relative to $GLOB_PREFIX) on match - never a bare
+# basename, since matches can come from different directories in the
+# complex-case sibling below, and this should look the same either way.
+glob_list_simple() {
+	local type="$1" size="$2" mtime="$3" name="$4" full
+	[[ "$name" =~ $GLOB_REGEX ]] || return 0
+	full=$(join_path "$GLOB_PREFIX" "$name")
+	if [[ "$SHOW_FULL_PATH" == "1" ]]; then
+		print_path_only_line "$type" "$size" "$mtime" "$full"
+	else
+		print_listing_line "$type" "$size" "$mtime" "$full"
+	fi
+}
+
+# Callback for remote_walk (glob "complex case"): matches a relpath
+# against $GLOB_REGEX, prints path-qualified (relative to $root, which
+# remote_walk always passes as the subtree root it was given) on match.
+glob_list_complex() {
+	local type="$1" size="$2" mtime="$3" relpath="$4" root="$5" full
+	[[ "$relpath" =~ $GLOB_REGEX ]] || return 0
+	full=$(join_path "$root" "$relpath")
+	if [[ "$SHOW_FULL_PATH" == "1" ]]; then
+		print_path_only_line "$type" "$size" "$mtime" "$full"
+	else
+		print_listing_line "$type" "$size" "$mtime" "$full"
+	fi
+}
+
+# get-side counterparts: skip matched directories (no implicit
+# recursion into them beyond what the pattern itself already expresses
+# via **) and download every matched file to the complete matched
+# remote path, recreated under $GLOB_DEST_ROOT - do_get_file's own
+# mkdir -p-equivalent local-directory creation already handles the
+# nested-destination case, so per-file resume applies exactly as it
+# does for -r, no extra logic needed here.
+glob_get_simple() {
+	local type="$1" size="$2" mtime="$3" name="$4"
+	[[ "$name" =~ $GLOB_REGEX ]] || return 0
+	[[ "$type" == "F" ]] || return 0
+	local full_remote
+	full_remote=$(join_path "$GLOB_PREFIX" "$name")
+	do_get_file "$full_remote" "$GLOB_DEST_ROOT/$full_remote"
+}
+
+glob_get_complex() {
+	local type="$1" size="$2" mtime="$3" relpath="$4" root="$5"
+	[[ "$relpath" =~ $GLOB_REGEX ]] || return 0
+	[[ "$type" == "F" ]] || return 0
+	local full_remote
+	full_remote=$(join_path "$root" "$relpath")
+	do_get_file "$full_remote" "$GLOB_DEST_ROOT/$full_remote"
+}
+
+# Callback for list_paginated (plain, non-glob `ls`): prints path-
+# qualified relative to $LS_PLAIN_PATH and column-free (see
+# print_path_only_line) when -1/SHOW_FULL_PATH is set, bare name in the
+# normal columnar format otherwise.
+LS_PLAIN_PATH=""
+ls_plain_line() {
+	local type="$1" size="$2" mtime="$3" name="$4"
+	if [[ "$SHOW_FULL_PATH" == "1" ]]; then
+		print_path_only_line "$type" "$size" "$mtime" "$(join_path "$LS_PLAIN_PATH" "$name")"
+	else
+		print_listing_line "$type" "$size" "$mtime" "$name"
+	fi
 }
 
 # Recursively walks $remote_root (a directory on the responder) via
-# repeated LIST calls - the wire protocol has no recursion of its own.
-# Invokes $callback once per entry found, as:
+# RECURSE, paginated (PAGE_SIZE entries per page, looping on "MORE
+# <cursor>" until a plain "END" - the server does the actual recursion
+# now, this just pages through a flat result stream). Invokes $callback
+# once per entry found, as:
 #   callback <type> <size> <mtime> <relpath> <remote_root>
 # where <relpath> is always relative to $remote_root and always /-
-# separated, regardless of the responder's own platform.
+# separated, regardless of the responder's own platform. Must fully
+# drain each page (through END/MORE) before invoking any callback - the
+# wire protocol is strictly request/response, and a callback that issues
+# its own request (GET) must never race a still-in-flight page.
 remote_walk() {
 	local remote_root="$1" callback="$2"
-	local -a dirs=("")
+	local cursor="" line rest type size mtime relpath
 	local -a ptype psize pmtime prel
-	local rel full line rest type size mtime name relpath i
-	while [[ ${#dirs[@]} -gt 0 ]]; do
-		rel="${dirs[0]}"
-		dirs=("${dirs[@]:1}")
-		if [[ -z "$rel" ]]; then
-			full="$remote_root"
+	local at_end more_cursor i
+	while true; do
+		if [[ -n "$cursor" ]]; then
+			printf 'RECURSE %s %s %s\n' "$remote_root" "$PAGE_SIZE" "$cursor" >&4
 		else
-			full=$(join_path "$remote_root" "$rel")
+			printf 'RECURSE %s %s\n' "$remote_root" "$PAGE_SIZE" >&4
 		fi
-		printf 'LIST %s\n' "$full" >&4
-		# Fully drain this LIST's response (through END) before invoking
-		# any callback - the wire protocol is strictly request/response.
 		ptype=() psize=() pmtime=() prel=()
+		at_end=0 more_cursor=""
 		while true; do
 			if ! read -t "$TIMEOUT" -r line <&3; then
 				echo >&2 "timed out (${TIMEOUT}s) or lost connection waiting for a response"
 				exit 1
 			fi
-			[[ "$line" == "END" ]] && break
 			case "$line" in
-				ERR\ *) echo >&2 "server: ${line#ERR } ($full)"; exit 1 ;;
+				END) at_end=1; break ;;
+				MORE\ *) more_cursor="${line#MORE }"; break ;;
+				ERR\ *) echo >&2 "server: ${line#ERR } ($remote_root)"; exit 1 ;;
 			esac
 			type=${line%% *}; rest=${line#* }
 			size=${rest%% *}; rest=${rest#* }
-			mtime=${rest%% *}; name=${rest#* }
-			if [[ -z "$rel" ]]; then
-				relpath="$name"
-			else
-				relpath="$rel/$name"
-			fi
+			mtime=${rest%% *}; relpath=${rest#* }
 			ptype+=("$type"); psize+=("$size"); pmtime+=("$mtime"); prel+=("$relpath")
 		done
 		for ((i = 0; i < ${#prel[@]}; i++)); do
 			"$callback" "${ptype[$i]}" "${psize[$i]}" "${pmtime[$i]}" "${prel[$i]}" "$remote_root"
-			[[ "${ptype[$i]}" == "D" ]] && dirs+=("${prel[$i]}")
 		done
+		[[ "$at_end" == "1" ]] && break
+		cursor="$more_cursor"
+	done
+}
+
+# Paginated single-level LIST - same pagination shape as remote_walk
+# above, but one directory's immediate children only (name is already
+# bare, no root/relpath to compute). Used by plain `ls` (no -r, no glob)
+# and the glob "simple case" (a pattern whose suffix can only ever match
+# one level deep, where a full RECURSE would walk an irrelevant subtree
+# for nothing). Invokes $callback once per entry found, as:
+#   callback <type> <size> <mtime> <name>
+list_paginated() {
+	local dir="$1" callback="$2"
+	local cursor="" line rest type size mtime name
+	local -a ptype psize pmtime pname
+	local at_end more_cursor i
+	while true; do
+		if [[ -n "$cursor" ]]; then
+			printf 'LIST %s %s %s\n' "$dir" "$PAGE_SIZE" "$cursor" >&4
+		else
+			printf 'LIST %s %s\n' "$dir" "$PAGE_SIZE" >&4
+		fi
+		ptype=() psize=() pmtime=() pname=()
+		at_end=0 more_cursor=""
+		while true; do
+			if ! read -t "$TIMEOUT" -r line <&3; then
+				echo >&2 "timed out (${TIMEOUT}s) or lost connection waiting for a response"
+				exit 1
+			fi
+			case "$line" in
+				END) at_end=1; break ;;
+				MORE\ *) more_cursor="${line#MORE }"; break ;;
+				ERR\ *) echo >&2 "server: ${line#ERR } ($dir)"; exit 1 ;;
+			esac
+			type=${line%% *}; rest=${line#* }
+			size=${rest%% *}; rest=${rest#* }
+			mtime=${rest%% *}; name=${rest#* }
+			ptype+=("$type"); psize+=("$size"); pmtime+=("$mtime"); pname+=("$name")
+		done
+		for ((i = 0; i < ${#pname[@]}; i++)); do
+			"$callback" "${ptype[$i]}" "${psize[$i]}" "${pmtime[$i]}" "${pname[$i]}"
+		done
+		[[ "$at_end" == "1" ]] && break
+		cursor="$more_cursor"
 	done
 }
 
@@ -972,35 +1256,38 @@ get_one() {
 
 case "$cmd" in
 	ls)
-		path="${2:-}"
-		if [[ "$RECURSIVE" == "1" ]]; then
+		path="${1:-}"
+		if is_glob "$path"; then
+			glob_split "$path"
+			GLOB_REGEX="$(glob_to_regex "$GLOB_SUFFIX")"
+			if glob_is_complex "$GLOB_SUFFIX"; then
+				remote_walk "$GLOB_PREFIX" glob_list_complex
+			else
+				list_paginated "$GLOB_PREFIX" glob_list_simple
+			fi
+		elif [[ "$RECURSIVE" == "1" ]]; then
 			path_clean="${path%/}"
 			[[ -n "$path_clean" ]] || path_clean="."
 			remote_walk "$path_clean" print_recursive_listing_line
 		else
-			printf 'LIST %s\n' "$path" >&4
-			while true; do
-				if ! read -t "$TIMEOUT" -r line <&3; then
-					echo >&2 "timed out (${TIMEOUT}s) or lost connection waiting for a response"
-					exit 1
-				fi
-				[[ "$line" == "END" ]] && break
-				case "$line" in
-					ERR\ *) echo >&2 "server: ${line#ERR }"; exit 1 ;;
-				esac
-				# <type> <size> <mtime> <name>
-				type=${line%% *}; rest=${line#* }
-				size=${rest%% *}; rest=${rest#* }
-				mtime=${rest%% *}; name=${rest#* }
-				print_listing_line "$type" "$size" "$mtime" "$name"
-			done
+			LS_PLAIN_PATH="$path"
+			list_paginated "$path" ls_plain_line
 		fi
 		;;
 	get)
-		remote_raw="${2:-}"
-		dest_root="${3:-}"
+		remote_raw="${1:-}"
+		dest_root="${2:-}"
 		[[ -n "$remote_raw" ]] || { echo >&2 "get requires a remote path"; exit 1; }
-		if [[ "$RECURSIVE" == "1" ]]; then
+		if is_glob "$remote_raw"; then
+			glob_split "$remote_raw"
+			GLOB_REGEX="$(glob_to_regex "$GLOB_SUFFIX")"
+			GLOB_DEST_ROOT="${dest_root:-.}"
+			if glob_is_complex "$GLOB_SUFFIX"; then
+				remote_walk "$GLOB_PREFIX" glob_get_complex
+			else
+				list_paginated "$GLOB_PREFIX" glob_get_simple
+			fi
+		elif [[ "$RECURSIVE" == "1" ]]; then
 			local_dest=$(effective_dest "$remote_raw" "$dest_root")
 			remote_clean="${remote_raw%/}"
 			[[ -n "$remote_clean" ]] || remote_clean="."
@@ -1011,8 +1298,8 @@ case "$cmd" in
 		fi
 		;;
 	put)
-		local_raw="${2:-}"
-		dest_root="${3:-}"
+		local_raw="${1:-}"
+		dest_root="${2:-}"
 		[[ -n "$local_raw" ]] || { echo >&2 "put requires a local path"; exit 1; }
 		[[ -e "$local_raw" ]] || { echo >&2 "no such file or directory: $local_raw"; exit 1; }
 		if [[ "$RECURSIVE" == "1" ]] && [[ -d "$local_raw" ]]; then
@@ -1039,10 +1326,52 @@ case "$cmd" in
 		# No -p flag: the responder's own do_mkdir already runs
 		# `mkdir -p` unconditionally (see its own comment), so every
 		# MKDIR on the wire always creates the whole tree.
-		remote_path="${2:-}"
+		remote_path="${1:-}"
 		[[ -n "$remote_path" ]] || { echo >&2 "mkdir requires a remote path"; exit 1; }
 		remote_mkdir "$remote_path" || exit 1
 		echo "mkdir $remote_path"
+		;;
+	stat)
+		remote_path="${1:-.}"
+		printf 'STAT %s\n' "$remote_path" >&4
+		read_response resp || exit 1
+		case "$resp" in
+			OK\ *)
+				# OK <type> <size> <mtime> <atime> <birthtime> <file_count> <dir_count>
+				# - same field-splitting idiom list_paginated/remote_walk
+				# already use, not `read -r ... <<<`: every field here is
+				# a plain token (no embedded spaces to worry about), so
+				# either approach would work, but this keeps the parsing
+				# style consistent across the whole file.
+				st_rest="${resp#OK }"
+				st_type="${st_rest%% *}"; st_rest="${st_rest#* }"
+				st_size="${st_rest%% *}"; st_rest="${st_rest#* }"
+				st_mtime="${st_rest%% *}"; st_rest="${st_rest#* }"
+				st_atime="${st_rest%% *}"; st_rest="${st_rest#* }"
+				st_btime="${st_rest%% *}"; st_rest="${st_rest#* }"
+				st_files="${st_rest%% *}"; st_rest="${st_rest#* }"
+				st_dirs="$st_rest"
+				if [[ "$st_type" == "D" ]]; then
+					printf 'type:       directory\n'
+				else
+					printf 'type:       file\n'
+					printf 'size:       %s (%s)\n' "$st_size" "$(human_size "$st_size")"
+				fi
+				printf 'mtime:      %s\n' "$(human_date "$st_mtime")"
+				printf 'atime:      %s\n' "$(human_date "$st_atime")"
+				if [[ "$st_btime" == "0" ]]; then
+					printf 'birthtime:  unknown\n'
+				else
+					printf 'birthtime:  %s\n' "$(human_date "$st_btime")"
+				fi
+				if [[ "$st_type" == "D" ]]; then
+					printf 'files:      %s\n' "$st_files"
+					printf 'dirs:       %s\n' "$st_dirs"
+				fi
+				;;
+			ERR\ *) echo >&2 "server: ${resp#ERR }"; exit 1 ;;
+			*) echo >&2 "unexpected response: $resp"; exit 1 ;;
+		esac
 		;;
 	*)
 		usage
