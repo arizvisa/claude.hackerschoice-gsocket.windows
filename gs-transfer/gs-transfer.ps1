@@ -90,6 +90,27 @@ param(
 	[Alias("h", "?")][switch]$Help
 )
 
+# Plain stdout/stderr writes for launcher and client mode's own
+# human-readable status output - deliberately not Write-Host/Write-Error.
+# Write-Host writes to the Information stream (6), which a bare `>`
+# (stream 1) never captures - piping/redirecting this script's stdout
+# silently drops everything printed via Write-Host even though it still
+# shows up live on screen. Write-Error does get captured by `2>`, but
+# wraps every message in PowerShell's own multi-line ErrorRecord format
+# instead of the clean single-line text a native tool's stderr would
+# produce. These two write straight to the real OS-level stdout/stderr
+# streams instead. Defined this early (before Show-Usage, which uses
+# them) deliberately - PowerShell only defines a function once that
+# `function` statement itself has executed, not hoisted to the top of
+# the script, and Show-Usage can be called as early as the -Help check
+# right after the param block below.
+function Write-Out([string]$text) {
+	[Console]::Out.WriteLine($text)
+}
+function Write-Err([string]$text) {
+	[Console]::Error.WriteLine($text)
+}
+
 # Single source of truth for usage text - mirrors ../posix/gs-transfer.sh's
 # own usage() (same two lines, same content, just PowerShell's parameter
 # names in place of getopts flags) - called whenever the command verb is
@@ -244,26 +265,6 @@ function Write-Line([System.IO.Stream]$stream, [string]$text) {
 	$bytes = [System.Text.Encoding]::ASCII.GetBytes($text + "`n")
 	$stream.Write($bytes, 0, $bytes.Length)
 	$stream.Flush()
-}
-
-# Plain stdout/stderr writes for launcher and client mode's own
-# human-readable status output - deliberately not Write-Host/Write-Error.
-# Write-Host writes to the Information stream (6), which a bare `>`
-# (stream 1) never captures - piping/redirecting this script's stdout
-# silently drops everything printed via Write-Host even though it still
-# shows up live on screen. Write-Error does get captured by `2>`, but
-# wraps every message in PowerShell's own multi-line ErrorRecord format
-# instead of the clean single-line text a native tool's stderr would
-# produce. These two write straight to the real OS-level stdout/stderr
-# streams instead - same raw-stream philosophy already used for the wire
-# protocol itself (Write-Line above), just via the convenience TextWriter
-# wrappers since these are plain human-readable lines, not binary
-# payloads.
-function Write-Out([string]$text) {
-	[Console]::Out.WriteLine($text)
-}
-function Write-Err([string]$text) {
-	[Console]::Error.WriteLine($text)
 }
 
 function Read-Line([System.IO.Stream]$stream) {
