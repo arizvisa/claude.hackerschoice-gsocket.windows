@@ -543,21 +543,65 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 	# trigger for glob matching in ls/get. Accepted tradeoff, same one
 	# every shell glob already makes: a real remote filename literally
 	# containing * or ? can no longer be fetched by exact name.
+	# True if $path contains an *unescaped* glob metacharacter (*, ?,
+	# [, or {) anywhere - the trigger for glob matching in ls/get. A
+	# backslash escapes the very next character unconditionally (bash's
+	# own rule, not just before a special char), so an escaped "\*" etc.
+	# never counts. Deliberately conservative about [ and {: even a
+	# malformed one (no matching close, or otherwise unparseable) still
+	# triggers "treat as glob" here - ConvertTo-GlobRegexBody below
+	# degrades a malformed one back to a literal character anyway, so
+	# at worst this costs an unnecessary LIST/RECURSE round trip for
+	# what turns out to be an exact match, never an incorrect result.
 	function Test-IsGlob([string]$path) {
-		return $path.IndexOfAny([char[]]@('*', '?')) -ge 0
+		$i = 0; $n = $path.Length
+		while ($i -lt $n) {
+			$c = $path.Substring($i, 1)
+			if ($c -eq '\' -and ($i + 1) -lt $n) { $i += 2; continue }
+			if ($c -in @('*', '?', '[', '{')) { return $true }
+			$i++
+		}
+		return $false
+	}
+
+	# Strips backslash-escapes from a path that Test-IsGlob already said
+	# isn't a glob at all - a user may still type e.g. "weird\*file" to
+	# be unambiguous about a literal special character even when the
+	# path as a whole has no real wildcard elsewhere, and that backslash
+	# must never reach the wire: the protocol has no escape-sequence
+	# concept of its own (Test-SafePath rejects a literal "\" outright),
+	# so every non-glob path ls/get actually sends - plain or -Recursive
+	# - runs through this first.
+	function Remove-GlobEscapes([string]$path) {
+		$out = ""
+		$i = 0; $n = $path.Length
+		while ($i -lt $n) {
+			$c = $path.Substring($i, 1)
+			if ($c -eq '\' -and ($i + 1) -lt $n) {
+				$out += $path.Substring($i + 1, 1)
+				$i += 2
+				continue
+			}
+			$out += $c
+			$i++
+		}
+		return $out
 	}
 
 	# Splits $pattern into .Prefix (literal segments before the first
 	# wildcard segment, "." if none) and .Suffix (that segment through
 	# the end) - see docs/gs-transfer-client-plan.md (kept local, not
 	# part of this repo) for the full design. Only ever called after
-	# Test-IsGlob confirms a wildcard exists somewhere.
+	# Test-IsGlob confirms a wildcard exists somewhere. Per-segment
+	# wildcard test reuses Test-IsGlob directly, so escaping stays
+	# consistent between "where does the literal prefix end" and "is
+	# this a glob at all".
 	function Split-GlobPattern([string]$pattern) {
 		$segs = $pattern.Split('/')
 		$i = 0
 		$prefixParts = @()
 		while ($i -lt $segs.Length) {
-			if ($segs[$i].IndexOfAny([char[]]@('*', '?')) -ge 0) { break }
+			if (Test-IsGlob $segs[$i]) { break }
 			$prefixParts += $segs[$i]
 			$i++
 		}
@@ -566,49 +610,237 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 		return [PSCustomObject]@{ Prefix = $prefix; Suffix = $suffix }
 	}
 
-	# Translates $suffix (see Split-GlobPattern) into a .NET regex,
-	# anchored at both ends: * -> [^/]*, ? -> [^/], **/ -> zero-or-more
-	# whole segments ((.*/)?) - makes **/*.txt match both readme.txt
-	# (root) and a/b/readme.txt (any depth) - bare ** (no following /)
-	# -> .*, everything else escaped via [regex]::Escape. Known, accepted
-	# asymmetry: a *trailing* bare ** with nothing after it (photos/**)
-	# falls through to the generic .* branch rather than getting the
-	# same "optional" treatment - not worth special-casing for a pattern
-	# shape nobody asked for.
-	function ConvertTo-GlobRegex([string]$suffix) {
-		$out = "^"
-		$i = 0
-		$n = $suffix.Length
+	# Splits $s on unescaped "," into a list of alternative substrings -
+	# an escaped comma (\,) stays part of its own alternative untouched,
+	# so the recursive ConvertTo-GlobRegexBody call on that alternative
+	# is what actually interprets the escape.
+	function Split-GlobCommas([string]$s) {
+		$alts = New-Object System.Collections.Generic.List[string]
+		$i = 0; $n = $s.Length; $cur = ""
 		while ($i -lt $n) {
-			$c = $suffix[$i]
-			if ($c -eq '*' -and ($i + 1) -lt $n -and $suffix[$i + 1] -eq '*') {
-				if (($i + 2) -lt $n -and $suffix[$i + 2] -eq '/') {
+			$c = $s.Substring($i, 1)
+			if ($c -eq '\' -and ($i + 1) -lt $n) { $cur += $s.Substring($i, 2); $i += 2; continue }
+			if ($c -eq ',') { $alts.Add($cur); $cur = ""; $i++; continue }
+			$cur += $c; $i++
+		}
+		$alts.Add($cur)
+		return $alts
+	}
+
+	# Parses $inner as a brace sequence expression ("x..y" or
+	# "x..y..incr") into a list of literal terms, or $null if it isn't
+	# one - bash's own rule: x and y must be the same type (both integer
+	# or both a single letter); if either has a leading zero, every
+	# generated term is zero-padded to match the widest of the two; the
+	# default increment is 1 (direction inferred from x <= y), an
+	# explicit increment's magnitude is used with the inferred direction
+	# (not replicating bash's exact behavior for a *given* increment
+	# whose sign already contradicts the x/y direction - vanishingly
+	# rare, not worth chasing).
+	function Get-GlobBraceSequenceTerms([string]$inner) {
+		$m = [regex]::Match($inner, '^(-?[0-9]+|[A-Za-z])\.\.(-?[0-9]+|[A-Za-z])(\.\.(-?[0-9]+))?$')
+		if (-not $m.Success) { return $null }
+		$x = $m.Groups[1].Value
+		$y = $m.Groups[2].Value
+		$incrRaw = $m.Groups[4].Value
+		$terms = New-Object System.Collections.Generic.List[string]
+		if ($x -match '^-?[0-9]+$') {
+			if ($y -notmatch '^-?[0-9]+$') { return $null }
+			$xa = $x.TrimStart('-')
+			$ya = $y.TrimStart('-')
+			$width = 0
+			if (($xa.StartsWith("0") -and $xa.Length -gt 1) -or ($ya.StartsWith("0") -and $ya.Length -gt 1)) {
+				$width = [Math]::Max($xa.Length, $ya.Length)
+			}
+			$xNum = [int64]$xa; if ($x.StartsWith("-")) { $xNum = -$xNum }
+			$yNum = [int64]$ya; if ($y.StartsWith("-")) { $yNum = -$yNum }
+			$incr = 1
+			if ($incrRaw) { $incr = [int64]($incrRaw.TrimStart('-')) }
+			if ($incr -eq 0) { $incr = 1 }
+			$step = if ($xNum -le $yNum) { $incr } else { -$incr }
+			$i = $xNum
+			while ($true) {
+				if ($step -gt 0 -and $i -gt $yNum) { break }
+				if ($step -lt 0 -and $i -lt $yNum) { break }
+				$neg = $i -lt 0
+				$term = [Math]::Abs($i).ToString()
+				while ($width -gt 0 -and $term.Length -lt $width) { $term = "0$term" }
+				if ($neg) { $term = "-$term" }
+				$terms.Add($term)
+				$i += $step
+			}
+		} else {
+			if ($x -notmatch '^[A-Za-z]$' -or $y -notmatch '^[A-Za-z]$') { return $null }
+			$xo = [int][char]$x
+			$yo = [int][char]$y
+			$stepc = 1
+			if ($incrRaw) { $stepc = [int]($incrRaw.TrimStart('-')) }
+			if ($stepc -eq 0) { $stepc = 1 }
+			$step = if ($xo -le $yo) { $stepc } else { -$stepc }
+			$co = $xo
+			while ($true) {
+				if ($step -gt 0 -and $co -gt $yo) { break }
+				if ($step -lt 0 -and $co -lt $yo) { break }
+				$terms.Add([char]$co)
+				$co += $step
+			}
+		}
+		return $terms
+	}
+
+	# Translates $pattern (a glob suffix - see Split-GlobPattern) into a
+	# .NET regex body (no anchors - ConvertTo-GlobRegex below adds
+	# ^...$ at the top level; recursive calls for brace alternatives
+	# call this directly to get just the body). * -> [^/]*, ? -> [^/],
+	# **/ -> zero-or-more whole segments ((.*/)?) - makes **/*.txt
+	# match both readme.txt (root) and a/b/readme.txt (any depth) -
+	# bare ** (no following /) -> .*, everything else escaped via
+	# [regex]::Escape. Known, accepted asymmetry: a *trailing* bare **
+	# with nothing after it (photos/**) falls through to the generic .*
+	# branch rather than getting the same "optional" treatment - not
+	# worth special-casing for a pattern shape nobody asked for.
+	#
+	# \X escapes the very next character unconditionally, not just
+	# before a special one - the escaping backslash is discarded, same
+	# rule bash itself uses.
+	#
+	# [...] bracket expressions translate almost verbatim - .NET regex
+	# already supports the same plain set/range/negation syntax bash's
+	# own bracket expressions use. Only normalization needed: bash
+	# accepts *either* "!" or "^" for negation, .NET only recognizes
+	# "^". A "]" immediately after "[" or after a leading "!"/"^" is a
+	# literal member of the set, not the closing bracket (bash's own
+	# rule). No matching "]" at all -> malformed, falls through to a
+	# literal "\[" (matches bash's "incorrectly formed... left
+	# unchanged" philosophy). No POSIX named-class ([:alpha:] etc.)
+	# support - a literal "[:" sequence just becomes ordinary
+	# bracket-set characters in the output, a known, accepted quirk
+	# rather than an error.
+	#
+	# {...} brace expansion - one, non-nested, same-segment group per
+	# pattern (no "/" inside an alternative - that would need a
+	# different prefix/suffix per alternative, which is exactly the
+	# rearchitecture this design deliberately avoids). No matching "}",
+	# or a "/" inside -> malformed, same literal "\{" fallback as a bad
+	# bracket. Comma-list alternatives (Split-GlobCommas) and sequence
+	# expressions (Get-GlobBraceSequenceTerms) are the two recognized
+	# forms - neither -> malformed, same fallback. Each alternative/term
+	# is recursively run back through this same function (so
+	# "*.{txt,log}" or "img{1,[2-4]}.png" work - an alternative can
+	# itself contain "*"/"?"/"[...]", just not another "{...}" or a
+	# "/"), joined with "|". .NET regex actually tolerates an empty
+	# alternative inside a group ("(|txt)"), but POSIX ERE (bash's own
+	# [[ =~ ]] engine) does not - to keep both clients' behavior
+	# identical rather than quietly diverging, an empty alternative
+	# (e.g. "{,txt}") is handled the same way on both sides: it makes
+	# the whole group optional over the remaining ones ("(txt)?"); if
+	# every alternative was empty, the group contributes nothing at all.
+	function ConvertTo-GlobRegexBody([string]$pattern) {
+		$out = ""
+		$i = 0
+		$n = $pattern.Length
+		while ($i -lt $n) {
+			$c = $pattern.Substring($i, 1)
+			if ($c -eq '\' -and ($i + 1) -lt $n) {
+				$nc = $pattern.Substring($i + 1, 1)
+				$out += [regex]::Escape($nc)
+				$i += 2
+				continue
+			}
+			if ($c -eq '*' -and $pattern.Substring($i, [Math]::Min(2, $n - $i)) -eq '**') {
+				if ($i + 2 -lt $n -and $pattern.Substring($i + 2, 1) -eq '/') {
 					$out += "(.*/)?"
 					$i += 3
 				} else {
 					$out += ".*"
 					$i += 2
 				}
-			} elseif ($c -eq '*') {
-				$out += "[^/]*"
-				$i++
-			} elseif ($c -eq '?') {
-				$out += "[^/]"
-				$i++
-			} else {
-				$out += [regex]::Escape([string]$c)
-				$i++
+				continue
 			}
+			if ($c -eq '*') { $out += "[^/]*"; $i++; continue }
+			if ($c -eq '?') { $out += "[^/]"; $i++; continue }
+			if ($c -eq '[') {
+				$j = $i + 1; $close = -1
+				if ($j -lt $n -and ($pattern.Substring($j, 1) -eq '!' -or $pattern.Substring($j, 1) -eq '^')) { $j++ }
+				if ($j -lt $n -and $pattern.Substring($j, 1) -eq ']') { $j++ }
+				while ($j -lt $n) {
+					if ($pattern.Substring($j, 1) -eq ']') { $close = $j; break }
+					$j++
+				}
+				if ($close -lt 0) { $out += "\["; $i++; continue }
+				$inner = $pattern.Substring($i + 1, $close - $i - 1)
+				if ($inner.StartsWith("!")) { $inner = "^" + $inner.Substring(1) }
+				$out += "[$inner]"
+				$i = $close + 1
+				continue
+			}
+			if ($c -eq '{') {
+				$j = $i + 1; $close = -1
+				while ($j -lt $n) {
+					$cj = $pattern.Substring($j, 1)
+					if ($cj -eq '\' -and ($j + 1) -lt $n) { $j += 2; continue }
+					if ($cj -eq '}') { $close = $j; break }
+					$j++
+				}
+				$inner = ""; $hasSlash = $false
+				if ($close -ge 0) {
+					$inner = $pattern.Substring($i + 1, $close - $i - 1)
+					$hasSlash = $inner.Contains('/')
+				}
+				if ($close -lt 0 -or $hasSlash) { $out += "\{"; $i++; continue }
+				$subRegexes = New-Object System.Collections.Generic.List[string]
+				$matched = $false
+				if ($inner.Contains(',')) {
+					$alts = Split-GlobCommas $inner
+					foreach ($alt in $alts) { $subRegexes.Add((ConvertTo-GlobRegexBody $alt)) }
+					$matched = $true
+				} else {
+					$terms = Get-GlobBraceSequenceTerms $inner
+					if ($null -ne $terms) {
+						foreach ($term in $terms) { $subRegexes.Add((ConvertTo-GlobRegexBody $term)) }
+						$matched = $true
+					}
+				}
+				if (-not $matched) { $out += "\{"; $i++; continue }
+				$nonempty = New-Object System.Collections.Generic.List[string]
+				$hasEmpty = $false
+				foreach ($sr in $subRegexes) {
+					if ([string]::IsNullOrEmpty($sr)) { $hasEmpty = $true } else { $nonempty.Add($sr) }
+				}
+				if ($nonempty.Count -gt 0) {
+					$joined = [string]::Join("|", $nonempty)
+					if ($hasEmpty) { $out += "($joined)?" } else { $out += "($joined)" }
+				}
+				$i = $close + 1
+				continue
+			}
+			$out += [regex]::Escape($c)
+			$i++
 		}
-		return $out + '$'
+		return $out
 	}
 
-	# True if $suffix needs a full recursive walk (RECURSE) rather than
-	# a single-level LIST - either it spans multiple segments, or it
-	# contains "**" anywhere (a bare "**" is itself one segment but
-	# still needs the full walk, since it can match any depth).
+	function ConvertTo-GlobRegex([string]$suffix) {
+		return "^" + (ConvertTo-GlobRegexBody $suffix) + '$'
+	}
+
+	# True if $suffix (a glob suffix) needs a full recursive walk
+	# (RECURSE) rather than a single-level LIST - either it spans
+	# multiple segments, or it contains an unescaped "**" anywhere (a
+	# bare "**" is itself one segment but still needs the full walk,
+	# since it can match any depth). Escape-aware like Test-IsGlob
+	# above, so a literal "\*\*" (an actual two-asterisk filename)
+	# doesn't get misread as the trigger.
 	function Test-GlobIsComplex([string]$suffix) {
-		return $suffix.Contains('/') -or $suffix.Contains('**')
+		$i = 0; $n = $suffix.Length
+		while ($i -lt $n) {
+			$c = $suffix.Substring($i, 1)
+			if ($c -eq '\' -and ($i + 1) -lt $n) { $i += 2; continue }
+			if ($c -eq '/') { return $true }
+			if ($c -eq '*' -and $suffix.Substring($i, [Math]::Min(2, $n - $i)) -eq '**') { return $true }
+			$i++
+		}
+		return $false
 	}
 
 	# Shared by Invoke-RemoteWalk (RECURSE) and Invoke-PaginatedList
@@ -879,7 +1111,7 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 						Invoke-PaginatedList $clientIn $clientOut $split.Prefix $Timeout $callback
 					}
 				} elseif ($Recursive) {
-					$pathClean = $path.TrimEnd('/')
+					$pathClean = (Remove-GlobEscapes $path).TrimEnd('/')
 					if ([string]::IsNullOrEmpty($pathClean)) { $pathClean = "." }
 					$callback = {
 						param($type, $size, $mtime, $relpath, $root)
@@ -888,6 +1120,7 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 					}.GetNewClosure()
 					Invoke-RemoteWalk $clientIn $clientOut $pathClean $Timeout $callback
 				} else {
+					$path = Remove-GlobEscapes $path
 					$callback = {
 						param($type, $size, $mtime, $name)
 						if ($FullPath) {
@@ -927,11 +1160,13 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 						Invoke-PaginatedList $clientIn $clientOut $split.Prefix $Timeout $callback
 					}
 				} elseif ($Recursive) {
+					$remoteRaw = Remove-GlobEscapes $remoteRaw
 					$localDest = Get-EffectiveDest $remoteRaw $destRoot
 					$remoteClean = $remoteRaw.TrimEnd('/')
 					if ([string]::IsNullOrEmpty($remoteClean)) { $remoteClean = "." }
 					Receive-DirectoryRecursive $clientIn $clientOut $remoteClean $localDest $Timeout $DataTimeout
 				} else {
+					$remoteRaw = Remove-GlobEscapes $remoteRaw
 					$localPath = if ($destRoot) { $destRoot } else { Split-Path -Leaf $remoteRaw }
 					Receive-File $clientIn $clientOut $remoteRaw $localPath $Timeout $DataTimeout
 				}
@@ -984,6 +1219,25 @@ if (($env:GSTRANSFER_WORKER -ne "1") -and (-not ($stdinIsPipe -and $hasNoConsole
 					$stType = $fields[0]; $stSize = [int64]$fields[1]; $stMtime = [int64]$fields[2]
 					$stAtime = [int64]$fields[3]; $stBtime = [int64]$fields[4]
 					$stFiles = $fields[5]; $stDirs = $fields[6]
+					# "path:" shows the responder's real absolute filesystem
+					# path, not just whatever (possibly relative, possibly
+					# bare) argument the user typed - resolved via a second
+					# request, PWD, same wire verb the `pwd` subcommand
+					# already uses, joined with the now-known-valid remote
+					# path. "." (or a path that trims down to it) means the
+					# root itself, no "/." suffix.
+					Write-Line $clientOut "PWD"
+					$pwdResp = Read-LineTimeout $clientIn $Timeout
+					$pwdRoot = if ($null -ne $pwdResp -and $pwdResp.StartsWith("OK ")) { $pwdResp.Substring(3) } else { "" }
+					$remoteClean = $remotePath.TrimEnd('/')
+					if ([string]::IsNullOrEmpty($pwdRoot)) {
+						$absPath = $remotePath
+					} elseif ([string]::IsNullOrEmpty($remoteClean) -or $remoteClean -eq ".") {
+						$absPath = $pwdRoot
+					} else {
+						$absPath = "$pwdRoot/$remoteClean"
+					}
+					Write-Out "path:       $absPath"
 					if ($stType -eq "D") {
 						Write-Out "type:       directory"
 					} else {
@@ -1108,11 +1362,28 @@ function Send-PaginatedListing([string]$dir, [Nullable[int]]$maxcount, [string]$
 	Write-Line $stdout "END"
 }
 
+# A trailing "/" is meaningful here (unlike every other verb, which
+# just trims it) - it's what disambiguates "list this directory's own
+# entry" from "list its contents", the same distinction real shells
+# make (`ls junk` vs `ls junk/`). "." (root) has no parent to show it
+# relative to, so it always means contents, slash or not.
 function Do-List([string]$dir, [Nullable[int]]$maxcount, [string]$cursor) {
 	if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
+	$wantContents = ($dir -eq ".")
+	if ($dir.EndsWith("/") -and $dir -ne ".") {
+		$dir = $dir.TrimEnd('/')
+		$wantContents = $true
+	}
 	if ($dir -ne ".") {
 		if (-not (Test-SafePath $dir)) { Write-Line $stdout "ERR invalid path"; return }
 		if (Test-Path -LiteralPath $dir -PathType Leaf) {
+			if ($wantContents) {
+				# Trailing "/" on a path that's actually a file - mirrors
+				# real `ls file.txt/` rather than silently falling back
+				# to a single-file listing.
+				Write-Line $stdout "ERR not a directory"
+				return
+			}
 			# A single file, not a directory - matches real `ls <file>`:
 			# list just that one entry instead of erroring. Re-split into
 			# parent/leaf so Send-PaginatedListing's own Join-Path-based
@@ -1123,6 +1394,15 @@ function Do-List([string]$dir, [Nullable[int]]$maxcount, [string]$cursor) {
 			return
 		}
 		if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Write-Line $stdout "ERR not found"; return }
+		if (-not $wantContents) {
+			# Bare directory name, no trailing "/": list just this one
+			# entry (the directory itself), same as the single-file case
+			# above - a trailing "/" is what asks for contents instead.
+			$parent = Split-Path -Path $dir -Parent
+			if ([string]::IsNullOrEmpty($parent)) { $parent = "." }
+			Send-PaginatedListing $parent $maxcount $cursor @((Split-Path -Path $dir -Leaf))
+			return
+		}
 	}
 	# Dot-prefixed names are excluded - Windows has no equivalent "hidden
 	# by naming convention" rule the way a bare shell glob does on POSIX
@@ -1142,6 +1422,7 @@ function Do-List([string]$dir, [Nullable[int]]$maxcount, [string]$cursor) {
 # every path segment, not just the leaf name - see its own comment.
 function Do-Recurse([string]$dir, [Nullable[int]]$maxcount, [string]$cursor) {
 	if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
+	if ($dir -ne ".") { $dir = $dir.TrimEnd('/') }
 	if ($dir -ne ".") {
 		if (-not (Test-SafePath $dir)) { Write-Line $stdout "ERR invalid path"; return }
 		if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Write-Line $stdout "ERR not found"; return }
@@ -1167,6 +1448,7 @@ function Do-Recurse([string]$dir, [Nullable[int]]$maxcount, [string]$cursor) {
 # (immediate children only, directories only - 0/0 for a file) size
 # whether a client should bother paginating a later LIST/RECURSE at all.
 function Do-Stat([string]$path) {
+	$path = $path.TrimEnd('/')
 	if (-not (Test-SafePath $path)) { Write-Line $stdout "ERR invalid path"; return }
 	$item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
 	if ($null -eq $item) { Write-Line $stdout "ERR not found"; return }
@@ -1189,6 +1471,7 @@ function Do-Stat([string]$path) {
 # unchanged: hashing the whole file is just n = the full size instead of
 # a resume offset, not new crypto code.
 function Do-Hash([string]$path) {
+	$path = $path.TrimEnd('/')
 	if (-not (Test-SafePath $path)) { Write-Line $stdout "ERR invalid path"; return }
 	if (Test-Path -LiteralPath $path -PathType Container) { Write-Line $stdout "ERR is a directory"; return }
 	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Write-Line $stdout "ERR not found"; return }
@@ -1197,7 +1480,9 @@ function Do-Hash([string]$path) {
 }
 
 function Do-Get([string]$path, [string]$offsetStr, [string]$claimedHash) {
+	$path = $path.TrimEnd('/')
 	if (-not (Test-SafePath $path)) { Write-Line $stdout "ERR invalid path"; return }
+	if (Test-Path -LiteralPath $path -PathType Container) { Write-Line $stdout "ERR is a directory - use recursive get (-r) instead"; return }
 	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Write-Line $stdout "ERR not found"; return }
 	$size = (Get-Item -LiteralPath $path).Length
 
@@ -1233,6 +1518,7 @@ function Do-Get([string]$path, [string]$offsetStr, [string]$claimedHash) {
 }
 
 function Do-Mkdir([string]$path) {
+	$path = $path.TrimEnd('/')
 	if (-not (Test-SafePath $path)) { Write-Line $stdout "ERR invalid path"; return }
 	try {
 		New-Item -ItemType Directory -Path $path -Force | Out-Null

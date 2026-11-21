@@ -292,14 +292,31 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]]; then
 		printf 'END\n'
 	}
 
+	# A trailing "/" is meaningful here (unlike every other verb, which
+	# just trims it) - it's what disambiguates "list this directory's
+	# own entry" from "list its contents", the same distinction real
+	# shells make (`ls junk` vs `ls junk/`). "." (root) has no parent to
+	# show it relative to, so it always means contents, slash or not.
 	do_list() {
-		local dir="${1:-.}" maxcount="${2:-}" cursor="${3:-}" f
+		local dir="${1:-.}" maxcount="${2:-}" cursor="${3:-}" f want_contents=0
+		[ "$dir" = "." ] && want_contents=1
+		if [[ "$dir" == */ ]] && [ "$dir" != "." ]; then
+			dir="${dir%/}"
+			want_contents=1
+		fi
 		if [ "$dir" != "." ]; then
 			if ! is_safe_path "$dir"; then
 				printf 'ERR invalid path\n'
 				return
 			fi
 			if [ -f "$dir" ]; then
+				if [ "$want_contents" = "1" ]; then
+					# Trailing "/" on a path that's actually a file -
+					# mirrors real `ls file.txt/` rather than silently
+					# falling back to a single-file listing.
+					printf 'ERR not a directory\n'
+					return
+				fi
 				# A single file, not a directory - matches real `ls
 				# <file>`: list just that one entry instead of erroring,
 				# reusing the exact same emission emit_paginated_listing
@@ -309,6 +326,14 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]]; then
 			fi
 			if [ ! -d "$dir" ]; then
 				printf 'ERR not found\n'
+				return
+			fi
+			if [ "$want_contents" != "1" ]; then
+				# Bare directory name, no trailing "/": list just this
+				# one entry (the directory itself), same as the
+				# single-file case above - a trailing "/" is what asks
+				# for contents instead.
+				emit_paginated_listing "$(dirname -- "$dir")" "$maxcount" "$cursor" < <(basename -- "$dir")
 				return
 			fi
 		fi
@@ -332,6 +357,7 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]]; then
 	# recursive listing.
 	do_recurse() {
 		local dir="${1:-.}" maxcount="${2:-}" cursor="${3:-}"
+		dir="${dir%/}"
 		if [ "$dir" != "." ]; then
 			if ! is_safe_path "$dir"; then
 				printf 'ERR invalid path\n'
@@ -367,6 +393,7 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]]; then
 	# client should bother paginating a later LIST/RECURSE at all.
 	do_stat() {
 		local path="$1" type size mtime atime btime file_count=0 dir_count=0 f
+		path="${path%/}"
 		if ! is_safe_path "$path"; then
 			printf 'ERR invalid path\n'
 			return
@@ -401,6 +428,7 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]]; then
 	# of a resume offset, not new crypto code.
 	do_hash() {
 		local path="$1" size
+		path="${path%/}"
 		if ! is_safe_path "$path"; then
 			printf 'ERR invalid path\n'
 			return
@@ -419,8 +447,13 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]]; then
 
 	do_get() {
 		local path="$1" offset="${2:-}" claimed_hash="${3:-}" size actual_hash remaining
+		path="${path%/}"
 		if ! is_safe_path "$path"; then
 			printf 'ERR invalid path\n'
+			return
+		fi
+		if [ -d "$path" ]; then
+			printf 'ERR is a directory - use recursive get (-r) instead\n'
 			return
 		fi
 		if [ ! -f "$path" ]; then
@@ -452,6 +485,7 @@ if [[ "${GSTRANSFER_WORKER:-}" == "1" ]]; then
 
 	do_mkdir() {
 		local path="$1"
+		path="${path%/}"
 		if ! is_safe_path "$path"; then
 			printf 'ERR invalid path\n'
 			return
@@ -820,15 +854,57 @@ print_recursive_listing_line() {
 	fi
 }
 
-# True if $1 contains a glob metacharacter (* or ?) anywhere - the
-# trigger for glob matching in ls/get. Accepted tradeoff, same one every
-# shell glob already makes: a real remote filename literally containing
-# * or ? can no longer be fetched by exact name.
+# True if $1 contains an *unescaped* glob metacharacter (*, ?, [, or {)
+# anywhere - the trigger for glob matching in ls/get. A backslash
+# escapes the very next character unconditionally (bash's own rule,
+# not just before a special char), so an escaped "\*" etc. never
+# counts. Deliberately conservative about [ and {: even a malformed
+# one (no matching close, or otherwise unparseable) still triggers
+# "treat as glob" here - glob_to_regex below degrades a malformed one
+# back to a literal character anyway, so at worst this costs an
+# unnecessary LIST/RECURSE round trip for what turns out to be an
+# exact match, never an incorrect result. Accepted tradeoff, same one
+# every shell glob already makes: a real remote filename literally
+# containing one of these (unescaped) can no longer be fetched by
+# exact name - escaping is the way out.
 is_glob() {
-	case "$1" in
-		*[*?]*) return 0 ;;
-		*) return 1 ;;
-	esac
+	local s="$1"
+	local i=0 n=${#s} c
+	while ((i < n)); do
+		c="${s:i:1}"
+		if [[ "$c" == '\' ]] && ((i + 1 < n)); then
+			i=$((i + 2))
+			continue
+		fi
+		case "$c" in
+			'*' | '?' | '[' | '{') return 0 ;;
+		esac
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# Strips backslash-escapes from a path that is_glob already said isn't
+# a glob at all - a user may still type e.g. "weird\*file" to be
+# unambiguous about a literal special character even when the path as
+# a whole has no real wildcard elsewhere, and that backslash must never
+# reach the wire: the protocol has no escape-sequence concept of its
+# own (is_safe_path rejects a literal "\" outright), so every non-glob
+# path ls/get actually sends - plain or -r - runs through this first.
+glob_unescape() {
+	local s="$1"
+	local out="" i=0 n=${#s} c
+	while ((i < n)); do
+		c="${s:i:1}"
+		if [[ "$c" == '\' ]] && ((i + 1 < n)); then
+			out+="${s:i+1:1}"
+			i=$((i + 2))
+			continue
+		fi
+		out+="$c"
+		i=$((i + 1))
+	done
+	printf '%s' "$out"
 }
 
 # Splits $1 (a glob pattern) into GLOB_PREFIX (literal segments before
@@ -836,7 +912,10 @@ is_glob() {
 # through the end) - see docs/gs-transfer-client-plan.md (kept local,
 # not part of this repo) for the full design. Plain globals, not a
 # return value - same "simplest way to hand extra context" idiom this
-# file already uses for LOCAL_DEST.
+# file already uses for LOCAL_DEST. Per-segment wildcard test reuses
+# is_glob directly, so escaping stays consistent between "where does
+# the literal prefix end" and "is this a glob at all" - one
+# implementation, no drift between the two checks.
 GLOB_PREFIX=""
 GLOB_SUFFIX=""
 glob_split() {
@@ -847,9 +926,7 @@ glob_split() {
 	local i=0
 	local -a prefix_parts=()
 	while [[ $i -lt ${#segs[@]} ]]; do
-		case "${segs[$i]}" in
-			*[*?]*) break ;;
-		esac
+		is_glob "${segs[$i]}" && break
 		prefix_parts+=("${segs[$i]}")
 		i=$((i + 1))
 	done
@@ -861,20 +938,180 @@ glob_split() {
 	GLOB_SUFFIX="${segs[*]:$i}"
 }
 
-# Translates $1 (a glob suffix - see glob_split) into a POSIX ERE,
-# anchored at both ends: * -> [^/]*, ? -> [^/], **/ -> zero-or-more
-# whole segments ((.*/)?) - makes **/*.txt match both readme.txt (root)
-# and a/b/readme.txt (any depth) - bare ** (no following /) -> .*,
+# Converts an ASCII letter code back to its character, for brace
+# sequence expressions ({a..e} etc.) - a plain lookup table, not
+# printf's own octal/hex escape tricks, which are fragile to transcribe
+# correctly and not needed when the only inputs are A-Z/a-z (bash's own
+# restriction for brace letter ranges too).
+chr_letter() {
+	local code="$1"
+	if ((code >= 97 && code <= 122)); then
+		local alphabet="abcdefghijklmnopqrstuvwxyz"
+		printf '%s' "${alphabet:code-97:1}"
+	elif ((code >= 65 && code <= 90)); then
+		local alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+		printf '%s' "${alphabet:code-65:1}"
+	fi
+}
+
+# Splits $1 on unescaped "," into GLOB_BRACE_ALTS (global array,
+# consumed immediately by the caller - same dynamic-scoping idiom as
+# GLOB_PREFIX/GLOB_SUFFIX above). An escaped comma (\,) stays part of
+# its own alternative untouched, so the recursive glob_to_regex_body
+# call on that alternative is what actually interprets the escape.
+GLOB_BRACE_ALTS=()
+glob_split_commas() {
+	local s="$1"
+	local i=0 n=${#s} c cur=""
+	GLOB_BRACE_ALTS=()
+	while ((i < n)); do
+		c="${s:i:1}"
+		if [[ "$c" == '\' ]] && ((i + 1 < n)); then
+			cur+="${s:i:2}"
+			i=$((i + 2))
+			continue
+		fi
+		if [[ "$c" == "," ]]; then
+			GLOB_BRACE_ALTS+=("$cur")
+			cur=""
+			i=$((i + 1))
+			continue
+		fi
+		cur+="$c"
+		i=$((i + 1))
+	done
+	GLOB_BRACE_ALTS+=("$cur")
+}
+
+# Parses $1 as a brace sequence expression ("x..y" or "x..y..incr") into
+# GLOB_SEQ_TERMS (global array, same idiom as GLOB_BRACE_ALTS) - bash's
+# own rule: x and y must be the same type (both integer or both a
+# single letter); if either has a leading zero, every generated term is
+# zero-padded to match the widest of the two; the default increment is 1
+# (direction inferred from x <= y), an explicit increment's magnitude is
+# used with the inferred direction (not replicating bash's exact
+# behavior for a *given* increment whose sign already contradicts the
+# x/y direction - vanishingly rare, not worth chasing). Returns 1
+# (GLOB_SEQ_TERMS untouched) if $1 isn't a valid sequence expression at
+# all. Integer parsing forces base 10 (10#...) throughout - bash
+# arithmetic otherwise treats a leading-zero numeral as octal, which
+# would misparse "08"/"09" or outright error.
+GLOB_SEQ_TERMS=()
+glob_brace_sequence_regex() {
+	local inner="$1"
+	local x y incr_raw incr x_num y_num width=0 step i term
+	GLOB_SEQ_TERMS=()
+	if [[ ! "$inner" =~ ^(-?[0-9]+|[A-Za-z])\.\.(-?[0-9]+|[A-Za-z])(\.\.(-?[0-9]+))?$ ]]; then
+		return 1
+	fi
+	x="${BASH_REMATCH[1]}"
+	y="${BASH_REMATCH[2]}"
+	incr_raw="${BASH_REMATCH[4]}"
+	if [[ "$x" =~ ^-?[0-9]+$ ]]; then
+		[[ "$y" =~ ^-?[0-9]+$ ]] || return 1
+		local xa="${x#-}" ya="${y#-}"
+		if [[ ("$xa" == 0* && ${#xa} -gt 1) || ("$ya" == 0* && ${#ya} -gt 1) ]]; then
+			width=${#xa}
+			((${#ya} > width)) && width=${#ya}
+		fi
+		x_num=$((10#$xa)); [[ "$x" == -* ]] && x_num=$((-x_num))
+		y_num=$((10#$ya)); [[ "$y" == -* ]] && y_num=$((-y_num))
+		incr=1
+		[[ -n "$incr_raw" ]] && incr=$((10#${incr_raw#-}))
+		((incr == 0)) && incr=1
+		if ((x_num <= y_num)); then step=$incr; else step=$((-incr)); fi
+		i=$x_num
+		while :; do
+			if ((step > 0 && i > y_num)); then break; fi
+			if ((step < 0 && i < y_num)); then break; fi
+			local neg=0 absterm="$i"
+			if ((i < 0)); then neg=1; absterm="${i#-}"; fi
+			term="$absterm"
+			while ((width > 0 && ${#term} < width)); do term="0$term"; done
+			((neg)) && term="-$term"
+			GLOB_SEQ_TERMS+=("$term")
+			i=$((i + step))
+		done
+	else
+		[[ "$x" =~ ^[A-Za-z]$ ]] || return 1
+		[[ "$y" =~ ^[A-Za-z]$ ]] || return 1
+		local xo yo stepc co
+		xo=$(printf '%d' "'$x")
+		yo=$(printf '%d' "'$y")
+		stepc=1
+		[[ -n "$incr_raw" ]] && stepc=$((10#${incr_raw#-}))
+		((stepc == 0)) && stepc=1
+		if ((xo <= yo)); then step=$stepc; else step=$((-stepc)); fi
+		co=$xo
+		while :; do
+			if ((step > 0 && co > yo)); then break; fi
+			if ((step < 0 && co < yo)); then break; fi
+			GLOB_SEQ_TERMS+=("$(chr_letter "$co")")
+			co=$((co + step))
+		done
+	fi
+	return 0
+}
+
+# Translates $1 (a glob suffix - see glob_split) into a POSIX ERE body
+# (no anchors - glob_to_regex below adds ^...$ at the top level;
+# recursive calls for brace alternatives call this directly to get just
+# the body). * -> [^/]*, ? -> [^/], **/ -> zero-or-more whole segments
+# ((.*/)?) - makes **/*.txt match both readme.txt (root) and
+# a/b/readme.txt (any depth) - bare ** (no following /) -> .*,
 # everything else escaped as a literal. Known, accepted asymmetry: a
 # *trailing* bare ** with nothing after it (photos/**) falls through to
 # the generic .* branch rather than getting the same "optional"
 # treatment, so it requires an actual / plus something after photos -
 # not worth special-casing for a pattern shape nobody asked for.
-glob_to_regex() {
+#
+# \X escapes the very next character unconditionally, not just before
+# a special one - the escaping backslash is discarded, same rule bash
+# itself uses.
+#
+# [...] bracket expressions translate almost verbatim - POSIX ERE
+# already supports the same plain set/range/negation syntax bash's own
+# bracket expressions use. Only normalization needed: bash accepts
+# *either* "!" or "^" for negation, ERE only recognizes "^". A "]"
+# immediately after "[" or after a leading "!"/"^" is a literal member
+# of the set, not the closing bracket (bash's own rule). No matching
+# "]" at all -> malformed, falls through to a literal "\[" (matches
+# bash's "incorrectly formed... left unchanged" philosophy). No POSIX
+# named-class ([:alpha:] etc.) support - a literal "[:" sequence just
+# becomes ordinary bracket-set characters in the output, a known,
+# accepted quirk rather than an error.
+#
+# {...} brace expansion - one, non-nested, same-segment group per
+# pattern (no "/" inside an alternative - that would need a different
+# prefix/suffix per alternative, which is exactly the rearchitecture
+# this design deliberately avoids). No matching "}", or a "/" inside ->
+# malformed, same literal "\{" fallback as a bad bracket. Comma-list
+# alternatives (glob_split_commas) and sequence expressions
+# (glob_brace_sequence_regex) are the two recognized forms - neither ->
+# malformed, same fallback. Each alternative/term is recursively run
+# back through this same function (so "*.{txt,log}" or
+# "img{1,[2-4]}.png" work - an alternative can itself contain
+# "*"/"?"/"[...]", just not another "{...}" or a "/"), joined with "|".
+# POSIX ERE (bash's own [[ =~ ]] engine) rejects an *empty* alternative
+# inside a group outright ("(|txt)" is a syntax error, not a zero-width
+# match the way PCRE would allow) - an empty alternative (e.g. "{,txt}")
+# instead makes the whole group optional over the remaining ones
+# ("(txt)?"); if every alternative was empty, the group contributes
+# nothing at all.
+glob_to_regex_body() {
 	local pattern="$1"
-	local out="^" i=0 n=${#pattern} c
+	local out="" i=0 n=${#pattern} c
 	while ((i < n)); do
 		c="${pattern:i:1}"
+		if [[ "$c" == '\' ]] && ((i + 1 < n)); then
+			local nc="${pattern:i+1:1}"
+			case "$nc" in
+				'.' | '[' | ']' | '(' | ')' | '{' | '}' | '+' | '^' | '$' | '|' | '\' | '*' | '?') out+="\\$nc" ;;
+				*) out+="$nc" ;;
+			esac
+			i=$((i + 2))
+			continue
+		fi
 		if [[ "$c" == "*" && "${pattern:i:2}" == "**" ]]; then
 			if [[ "${pattern:i+2:1}" == "/" ]]; then
 				out+="(.*/)?"
@@ -883,32 +1120,148 @@ glob_to_regex() {
 				out+=".*"
 				i=$((i + 2))
 			fi
-		elif [[ "$c" == "*" ]]; then
+			continue
+		fi
+		if [[ "$c" == "*" ]]; then
 			out+="[^/]*"
 			i=$((i + 1))
-		elif [[ "$c" == "?" ]]; then
+			continue
+		fi
+		if [[ "$c" == "?" ]]; then
 			out+="[^/]"
 			i=$((i + 1))
-		else
-			case "$c" in
-				'.' | '[' | ']' | '(' | ')' | '{' | '}' | '+' | '^' | '$' | '|' | '\') out+="\\$c" ;;
-				*) out+="$c" ;;
-			esac
-			i=$((i + 1))
+			continue
 		fi
+		if [[ "$c" == "[" ]]; then
+			local j=$((i + 1)) close=-1
+			if ((j < n)) && [[ "${pattern:j:1}" == "!" || "${pattern:j:1}" == "^" ]]; then
+				j=$((j + 1))
+			fi
+			if ((j < n)) && [[ "${pattern:j:1}" == "]" ]]; then
+				j=$((j + 1))
+			fi
+			while ((j < n)); do
+				[[ "${pattern:j:1}" == "]" ]] && { close=$j; break; }
+				j=$((j + 1))
+			done
+			if ((close < 0)); then
+				out+="\\["
+				i=$((i + 1))
+				continue
+			fi
+			local inner="${pattern:i+1:close-i-1}"
+			if [[ "${inner:0:1}" == "!" ]]; then
+				inner="^${inner:1}"
+			fi
+			out+="[$inner]"
+			i=$((close + 1))
+			continue
+		fi
+		if [[ "$c" == "{" ]]; then
+			local j=$((i + 1)) close=-1
+			while ((j < n)); do
+				local cj="${pattern:j:1}"
+				if [[ "$cj" == '\' ]] && ((j + 1 < n)); then
+					j=$((j + 2))
+					continue
+				fi
+				if [[ "$cj" == "}" ]]; then
+					close=$j
+					break
+				fi
+				j=$((j + 1))
+			done
+			local inner="" has_slash=0
+			if ((close >= 0)); then
+				inner="${pattern:i+1:close-i-1}"
+				[[ "$inner" == */* ]] && has_slash=1
+			fi
+			if ((close < 0)) || ((has_slash == 1)); then
+				out+="\\{"
+				i=$((i + 1))
+				continue
+			fi
+			local -a sub_regexes=()
+			local matched=0
+			if [[ "$inner" == *,* ]]; then
+				glob_split_commas "$inner"
+				local alt
+				for alt in "${GLOB_BRACE_ALTS[@]}"; do
+					sub_regexes+=("$(glob_to_regex_body "$alt")")
+				done
+				matched=1
+			elif glob_brace_sequence_regex "$inner"; then
+				local term
+				for term in "${GLOB_SEQ_TERMS[@]}"; do
+					sub_regexes+=("$(glob_to_regex_body "$term")")
+				done
+				matched=1
+			fi
+			if ((matched == 0)); then
+				out+="\\{"
+				i=$((i + 1))
+				continue
+			fi
+			local -a nonempty=()
+			local has_empty=0 sr
+			for sr in "${sub_regexes[@]}"; do
+				if [[ -z "$sr" ]]; then
+					has_empty=1
+				else
+					nonempty+=("$sr")
+				fi
+			done
+			if ((${#nonempty[@]} > 0)); then
+				local joined="" first=1
+				for sr in "${nonempty[@]}"; do
+					[[ $first -eq 1 ]] || joined+="|"
+					joined+="$sr"
+					first=0
+				done
+				if ((has_empty)); then
+					out+="($joined)?"
+				else
+					out+="($joined)"
+				fi
+			fi
+			i=$((close + 1))
+			continue
+		fi
+		case "$c" in
+			'.' | '[' | ']' | '(' | ')' | '{' | '}' | '+' | '^' | '$' | '|' | '\') out+="\\$c" ;;
+			*) out+="$c" ;;
+		esac
+		i=$((i + 1))
 	done
-	printf '%s$\n' "$out"
+	printf '%s' "$out"
+}
+
+glob_to_regex() {
+	printf '^%s$\n' "$(glob_to_regex_body "$1")"
 }
 
 # True if $1 (a glob suffix) needs a full recursive walk (RECURSE)
 # rather than a single-level LIST - either it spans multiple segments,
-# or it contains "**" anywhere (a bare "**" is itself one segment but
-# still needs the full walk, since it can match any depth).
+# or it contains an unescaped "**" anywhere (a bare "**" is itself one
+# segment but still needs the full walk, since it can match any
+# depth). Escape-aware like is_glob above, so a literal "\*\*" (an
+# actual two-asterisk filename) doesn't get misread as the trigger.
 glob_is_complex() {
-	case "$1" in
-		*/* | *'**'*) return 0 ;;
-		*) return 1 ;;
-	esac
+	local s="$1"
+	local i=0 n=${#s} c
+	while ((i < n)); do
+		c="${s:i:1}"
+		if [[ "$c" == '\' ]] && ((i + 1 < n)); then
+			i=$((i + 2))
+			continue
+		fi
+		[[ "$c" == "/" ]] && return 0
+		if [[ "$c" == "*" && "${s:i:2}" == "**" ]]; then
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
 }
 
 # Context for the glob callbacks below - set once by ls)/get) just
@@ -1266,10 +1619,12 @@ case "$cmd" in
 				list_paginated "$GLOB_PREFIX" glob_list_simple
 			fi
 		elif [[ "$RECURSIVE" == "1" ]]; then
-			path_clean="${path%/}"
+			path_clean="$(glob_unescape "$path")"
+			path_clean="${path_clean%/}"
 			[[ -n "$path_clean" ]] || path_clean="."
 			remote_walk "$path_clean" print_recursive_listing_line
 		else
+			path="$(glob_unescape "$path")"
 			LS_PLAIN_PATH="$path"
 			list_paginated "$path" ls_plain_line
 		fi
@@ -1288,11 +1643,13 @@ case "$cmd" in
 				list_paginated "$GLOB_PREFIX" glob_get_simple
 			fi
 		elif [[ "$RECURSIVE" == "1" ]]; then
+			remote_raw="$(glob_unescape "$remote_raw")"
 			local_dest=$(effective_dest "$remote_raw" "$dest_root")
 			remote_clean="${remote_raw%/}"
 			[[ -n "$remote_clean" ]] || remote_clean="."
 			recursive_get "$remote_clean" "$local_dest"
 		else
+			remote_raw="$(glob_unescape "$remote_raw")"
 			local_path="${dest_root:-$(basename -- "$remote_raw")}"
 			do_get_file "$remote_raw" "$local_path"
 		fi
@@ -1351,6 +1708,28 @@ case "$cmd" in
 				st_btime="${st_rest%% *}"; st_rest="${st_rest#* }"
 				st_files="${st_rest%% *}"; st_rest="${st_rest#* }"
 				st_dirs="$st_rest"
+				# "path:" shows the responder's real absolute filesystem
+				# path, not just whatever (possibly relative, possibly
+				# bare) argument the user typed - resolved via a second
+				# request, PWD, same wire verb the `pwd` subcommand
+				# already uses, joined with the now-known-valid remote
+				# path. "." (or a path that trims down to it) means the
+				# root itself, no "/." suffix.
+				printf 'PWD\n' >&4
+				read_response pwd_resp || exit 1
+				case "$pwd_resp" in
+					OK\ *) pwd_root="${pwd_resp#OK }" ;;
+					*) pwd_root="" ;;
+				esac
+				remote_clean="${remote_path%/}"
+				if [[ -z "$pwd_root" ]]; then
+					abs_path="$remote_path"
+				elif [[ -z "$remote_clean" || "$remote_clean" == "." ]]; then
+					abs_path="$pwd_root"
+				else
+					abs_path="$pwd_root/$remote_clean"
+				fi
+				printf 'path:       %s\n' "$abs_path"
 				if [[ "$st_type" == "D" ]]; then
 					printf 'type:       directory\n'
 				else

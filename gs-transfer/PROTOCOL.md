@@ -137,8 +137,15 @@ QUIT
 `LIST` with no argument lists the responder's current working directory;
 `LIST <path>` lists a subdirectory relative to it. If `<path>` names a
 plain file rather than a directory, `LIST` returns a listing of exactly
-that one entry (matching real `ls <file>`) instead of an error.
-`RECURSE <path>` walks
+that one entry (matching real `ls <file>`) instead of an error - and a
+bare *directory* path (no trailing `/`) gets the same one-entry
+treatment, matching real `ls dirname` vs `ls dirname/`: `LIST dirname`
+lists the `dirname` entry itself, `LIST dirname/` lists what's inside
+it. A trailing `/` on a path that turns out to be a plain file is
+`ERR not a directory`, not a silent single-file listing. This
+distinction is `LIST`-only - every other verb's path is never a
+"contents vs. entry" question, so a trailing `/` is simply stripped
+there (see **Path rules** below). `RECURSE <path>` walks
 the whole subtree under `<path>` instead of just its immediate children -
 see **Pagination (LIST, RECURSE)** below for `<maxcount>`/`<cursor>` on
 both verbs, and **Recursion (`-r`)**/**Globbing** below for how the
@@ -173,10 +180,13 @@ something the wire format needs to know about.
 LIST/RECURSE success : zero or more "<type> <size> <mtime> <name>" lines, then
                         one of "END" (no more pages) | "MORE <cursor>" (more
                         remain, see Pagination below) | "ERR <reason>"
+LIST failure   : "ERR not found" | "ERR invalid path" | "ERR not a directory"
+                  (the last one only for a trailing "/" on a plain file -
+                  see above)
 GET success    : "OK <n>" followed by exactly <n> raw bytes - <n> is the
                   full file size for a plain GET, or just the remaining
                   bytes for a resume GET (see below)
-GET failure    : "ERR <reason>"
+GET failure    : "ERR not found" | "ERR invalid path" | "ERR is a directory"
 PUT, step 1    : "FRESH" | "RESUME <offset> <hash>" | "ERR <reason>"
 PUT, step 2    : (final) "OK" | "ERR <reason>"
 MKDIR success  : "OK"
@@ -232,10 +242,16 @@ protocol's trust model has no partial-access concept); a "does a
 `.partial` already exist" pre-check (already free via `PUT`'s own
 `FRESH`/`RESUME` handshake).
 
-The client exposes this directly as `stat [path]` - one request, no
-`LIST`/`RECURSE` pagination involved, printing the fields above in a
-human-readable form (sizes/dates formatted the same way `ls` already
-does, `birthtime: unknown` for the `0`-means-unknown case).
+The client exposes this directly as `stat [path]` - no `LIST`/`RECURSE`
+pagination involved, printing the fields above in a human-readable form
+(sizes/dates formatted the same way `ls` already does, `birthtime:
+unknown` for the `0`-means-unknown case), plus a `path:` line showing
+the responder's real absolute filesystem path rather than whatever
+(possibly relative, possibly bare) argument the user actually typed.
+That line costs a second request - `PWD`, the same verb the `pwd`
+subcommand already uses - joined with the given path client-side; `.`
+(or anything that trims down to it) means the root itself, no trailing
+`/.`.
 
 ### `HASH`
 
@@ -306,8 +322,18 @@ responder's starting directory:
   responder is Windows - a literal `\` anywhere in the path is rejected
   outright rather than treated as a separator, so the wire format stays
   identical cross-platform.
-- No empty components (`a//b`, a trailing `/`) and no empty path.
+- No empty components (`a//b`) and no empty path.
 - A bare `.` component is allowed (resolves to "this directory").
+
+A single *trailing* `/` is handled before this check ever runs, not by
+it, and differently depending on the verb: every verb except `LIST`
+simply strips it (`mydir` and `mydir/` are the same request) since none
+of them have a "contents vs. entry" distinction to make. `LIST` is the
+one exception - a trailing `/` is meaningful there (see **Wire
+format**'s `LIST` description above) - and `PUT`'s target path is the
+other: a trailing `/` on a `PUT` target is rejected outright, since a
+`PUT` target is always a specific file, never a directory, and there's
+no sensible way to normalize it away.
 
 Anything failing these checks gets `ERR invalid path` (or, on a `PUT`
 with a bad path, the responder still drains exactly `<size>` bytes from
@@ -579,18 +605,27 @@ the destination layout.
 
 ## Globbing
 
-`ls`/`get` accept `*`, `?`, and `**` in the path argument - auto-detected
-(any `*`/`?` anywhere means "treat as a pattern"), no separate flag.
-Still purely client-side, same as `-r` - the responder has no concept of
-a pattern at all, it only ever sees plain `LIST`/`RECURSE` requests for a
-literal path the client already resolved.
+`ls`/`get` accept `*`, `?`, `**`, `[...]` bracket expressions, `{...}`
+brace expansion, and backslash escaping in the path argument -
+auto-detected (any *unescaped* `*`/`?`/`[`/`{` anywhere means "treat as
+a pattern"), no separate flag. Still purely client-side, same as `-r` -
+the responder has no concept of a pattern at all, it only ever sees
+plain `LIST`/`RECURSE` requests for a literal path the client already
+resolved.
+
+**Escaping**: a `\` makes the very next character literal,
+unconditionally - not just before a special one - and the escaping
+backslash itself is discarded, the same rule bash itself uses. This is
+the escape hatch for a real filename that happens to contain `*`, `?`,
+`[`, or `{` (e.g. `ls weird\*file` reaches a file literally named
+`weird*file`).
 
 **Splitting a pattern into prefix + suffix**: split on `/`; the first
-segment containing `*`/`?` is where the literal part ends - everything
-before it is the `prefix` (`.` if the very first segment has a
-wildcard), that segment through the end is the `suffix`. No wildcard
-anywhere in the whole pattern -> not a glob, exact-path behavior
-unchanged.
+segment containing an *unescaped* `*`/`?`/`[`/`{` is where the literal
+part ends - everything before it is the `prefix` (`.` if the very first
+segment has one), that segment through the end is the `suffix`. No
+unescaped wildcard anywhere in the whole pattern -> not a glob,
+exact-path behavior unchanged.
 
 **Simple case** (suffix is one segment, no `**`): one paginated `LIST
 <prefix>`, matching each entry's bare name - `ls photos/*.jpg` never
@@ -609,10 +644,58 @@ both ends - `*` -> `[^/]*`, `?` -> `[^/]`, a `**` immediately followed by
 `/` -> `(.*/)?` (zero-or-more whole segments, including the slash - the
 part that makes `**/*.txt` match both a root-level file and a nested
 one), a bare `**` with nothing after it -> `.*`, everything else escaped
-as a literal. Known, accepted asymmetry: a *trailing* bare `**`
-(`photos/**`) falls through to the generic `.*` branch rather than
+as a literal (an escaped character is always escaped as a literal too,
+regardless of what it is). Known, accepted asymmetry: a *trailing* bare
+`**` (`photos/**`) falls through to the generic `.*` branch rather than
 getting the same "optional" treatment as the leading case - not worth
 special-casing for a pattern shape nobody's asked for.
+
+**`[...]` bracket expressions** translate almost verbatim - POSIX ERE
+(bash) and .NET regex (PowerShell) both already support the same plain
+set/range/negation syntax bash's own bracket expressions use (`[abc]`,
+`[a-z]`, `[!0-9]`/`[^0-9]` - bash accepts either `!` or `^` for
+negation, both regex flavors only recognize `^`, so a leading `!` is
+normalized to `^`). A `]` immediately after `[`, or immediately after a
+leading negation marker, is a literal member of the set rather than the
+closing bracket (bash's own rule). No POSIX named classes (`[:alpha:]`
+etc.) - deliberately excluded: those need a `.NET`-side translation
+table matching each class name to an equivalent, an asymmetry (bash's
+own regex engine supports them natively) not worth taking on; a literal
+`[:` sequence just becomes ordinary bracket-set characters, a known,
+accepted quirk rather than an error. No matching `]` at all -> the `[`
+is treated as a literal character instead (same "incorrectly formed...
+left unchanged" philosophy bash itself uses for a malformed construct).
+
+**`{...}` brace expansion** supports both forms bash does - comma-lists
+(`{a,b,c}`, including an empty alternative like `{,txt}`) and sequence
+expressions (`{x..y}` / `{x..y..incr}`, numeric with optional
+zero-padding/negative numbers, or a single a-z/A-Z letter, direction
+inferred from `x`/`y`, descending included). Scoped to **one,
+non-nested, same-segment group per pattern** - an alternative may not
+contain `/` - which is what keeps this a pure extension of the
+prefix/suffix split above rather than needing a different prefix/
+suffix per alternative (the rearchitecture that would require was
+explicitly scoped out). Each alternative/term is recursively run back
+through the same translation, so an alternative can itself contain
+`*`/`?`/`[...]` (`*.{txt,log}`, `img{1,[2-4]}.png`), just not another
+`{...}` or a `/`. No matching `}`, a `/` inside, or content that's
+neither a comma-list nor a valid sequence expression -> the `{` is
+treated as a literal character instead, same philosophy as a malformed
+bracket. One cross-platform subtlety worth noting: an empty alternative
+(`{,txt}`) can't become a bare empty branch inside a group (`(|txt)`) -
+.NET regex tolerates that, but POSIX ERE (bash's own `[[ =~ ]]` engine)
+rejects it outright as a syntax error - so both implementations instead
+make the whole group *optional* over the remaining alternatives
+(`(txt)?`), keeping behavior identical on both platforms rather than
+letting one silently diverge. Deliberately excluded: `extglob`
+operators (`?(...)`/`*(...)`/`+(...)`/`@(...)`/`!(...)`) - not just
+lower-value (an opt-in, rarely-typed bash feature), but `!(...)`
+(negative match) has no translation into POSIX ERE at all (no
+lookahead/lookaround support), so it would need an entirely different
+two-pass matching strategy rather than a regex-string addition like
+everything else here; nested or multiple brace groups in one pattern,
+also excluded for the same same-segment-only reasoning as the `/`
+restriction.
 
 **Display and destination**: `ls` on a glob match always prints the full
 path relative to the responder's root, never a bare basename, since
