@@ -47,11 +47,28 @@ typedef SSIZE_T ssize_t;
 
 #define BUF_SZ 4096
 
+/* How long to wait, after the GS peer has sent EOF, for the local side
+ * to also close on its own before giving up on it and ending the
+ * session anyway - mirrors gs-netcat's own GS_PEER_IDLE_TIMEOUT_EOF_TCP
+ * (4_gs-netcat.c), same 2 seconds, just in ms since this file has no
+ * use for gsocket's own usec time helpers otherwise.
+ */
+#define GS_TUNNEL_EOF_IDLE_MS 2000
+
 struct session
 {
 	GS *gs;
 	SOCKET local_fd;
 	int done;
+
+	/* Set once the GS peer has sent EOF (cb_read_gs()), so the
+	 * relay_session() loop can give up waiting for the local side to
+	 * also close on its own after GS_TUNNEL_EOF_IDLE_MS - some simple
+	 * local protocols never close just because their peer did a
+	 * half-close, which would otherwise hang the session forever.
+	 */
+	int is_received_gs_eof;
+	ULONGLONG gs_eof_ts;
 
 	unsigned char gs2local_buf[BUF_SZ];
 	size_t gs2local_len;
@@ -119,9 +136,19 @@ cb_read_local(GS_SELECT_CTX *ctx, int fd, void *arg, int val)
 	int n = recv(sess->local_fd, (char *)sess->local2gs_buf, sizeof sess->local2gs_buf, 0);
 	if (n == 0)
 	{
-		/* Local side closed. Tell peer by shutting down our GS write side. */
-		GS_shutdown(sess->gs);
+		/* Local side closed. Tell peer by shutting down our GS write
+		 * side. GS_ERR_FATAL means the peer's close-notify already
+		 * arrived too - both sides are done. Mirrors the same check
+		 * gs-netcat's own cb_read_local already makes (4_gs-netcat.c) -
+		 * this just never looked at the return value before, which
+		 * meant the common "both sides close" case never actually
+		 * ended the session, so the listener never got back to
+		 * accepting the next connection.
+		 */
+		int ret = GS_shutdown(sess->gs);
 		FD_CLR((int)sess->local_fd, ctx->rfd);
+		if (ret == GS_ERR_FATAL)
+			sess->done = 1;
 		return GS_SUCCESS;
 	}
 	if (n < 0)
@@ -191,6 +218,14 @@ cb_read_gs(GS_SELECT_CTX *ctx, int fd, void *arg, int val)
 	if (len == GS_ERR_EOF)
 	{
 		shutdown(sess->local_fd, SD_SEND);
+		/* Record when the GS peer's EOF arrived - relay_session()'s
+		 * own loop uses this to give up on the local side eventually
+		 * closing on its own (see GS_TUNNEL_EOF_IDLE_MS), since not
+		 * every local protocol closes just because its peer did a
+		 * half-close.
+		 */
+		sess->is_received_gs_eof = 1;
+		sess->gs_eof_ts = GetTickCount64();
 		return GS_SUCCESS;
 	}
 	if (len < 0)
@@ -249,6 +284,16 @@ relay_session(GS_CTX *gs_ctx, GS *gs, SOCKET local_fd)
 		GS_heartbeat(gs);
 		if (n < 0)
 			break;
+		/* The GS peer closed, but the local side hasn't closed on its
+		 * own after a reasonable wait - give up on it rather than
+		 * hang this session (and therefore the whole listener, which
+		 * never gets back to GS_accept() until this session ends)
+		 * forever. Mirrors gs-netcat's own idle-after-EOF teardown
+		 * (cbe_peer_timeout/GS_PEER_IDLE_TIMEOUT_EOF_TCP).
+		 */
+		if (sess.is_received_gs_eof &&
+		    (GetTickCount64() - sess.gs_eof_ts) >= GS_TUNNEL_EOF_IDLE_MS)
+			sess.done = 1;
 	}
 	fprintf(stderr, "Session ended.\n");
 
@@ -297,7 +342,15 @@ tcp_connect(const char *ip, int port)
 
 	if (connect(s, (struct sockaddr *)&sin, sizeof sin) != 0)
 	{
+		/* closesocket() is itself a Winsock call - it can (and does,
+		 * in practice) clobber connect()'s own error before the
+		 * caller's WSAGetLastError() ever gets to read it, which is
+		 * why this used to always report "failed: 0". Save and
+		 * restore the real one across the close.
+		 */
+		int err = WSAGetLastError();
 		closesocket(s);
+		WSASetLastError(err);
 		return INVALID_SOCKET;
 	}
 	return s;
